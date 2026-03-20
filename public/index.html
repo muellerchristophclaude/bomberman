@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bomberman Multiplayer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #1a1a2e;
+      color: #eee;
+      font-family: 'Courier New', monospace;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+      padding: 16px;
+    }
+    h1 {
+      font-size: 2rem;
+      color: #f39c12;
+      text-shadow: 0 0 20px #f39c12;
+      margin-bottom: 12px;
+      letter-spacing: 4px;
+    }
+    #lobby {
+      background: #16213e;
+      border: 2px solid #0f3460;
+      border-radius: 12px;
+      padding: 32px;
+      max-width: 400px;
+      width: 100%;
+      text-align: center;
+    }
+    #lobby h2 { color: #f39c12; margin-bottom: 20px; }
+    .form-group { margin-bottom: 16px; text-align: left; }
+    .form-group label { display: block; margin-bottom: 6px; color: #aaa; font-size: 0.85rem; }
+    .form-group input {
+      width: 100%;
+      padding: 10px 14px;
+      background: #0f3460;
+      border: 1px solid #2c5282;
+      border-radius: 6px;
+      color: #eee;
+      font-size: 1rem;
+      outline: none;
+    }
+    .form-group input:focus { border-color: #f39c12; }
+    button {
+      background: #f39c12;
+      color: #1a1a2e;
+      border: none;
+      padding: 12px 28px;
+      border-radius: 8px;
+      font-size: 1rem;
+      font-weight: bold;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    button:hover { background: #e67e22; transform: translateY(-1px); }
+    button:disabled { background: #555; color: #888; cursor: not-allowed; transform: none; }
+    #game-container { display: none; flex-direction: column; align-items: center; gap: 12px; }
+    #info-bar {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      background: #16213e;
+      padding: 8px 16px;
+      border-radius: 8px;
+      width: 100%;
+      max-width: 620px;
+      flex-wrap: wrap;
+    }
+    .player-info {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.8rem;
+    }
+    .player-dot {
+      width: 14px; height: 14px;
+      border-radius: 50%;
+      border: 2px solid rgba(255,255,255,0.3);
+    }
+    .player-info.dead { opacity: 0.4; text-decoration: line-through; }
+    #canvas-wrapper {
+      position: relative;
+    }
+    #gameCanvas {
+      display: block;
+      border: 3px solid #0f3460;
+      border-radius: 4px;
+      image-rendering: pixelated;
+    }
+    #overlay {
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0,0,0,0.75);
+      border-radius: 4px;
+      font-size: 1.2rem;
+      gap: 16px;
+    }
+    #overlay h2 { font-size: 2rem; color: #f39c12; }
+    #controls-hint {
+      font-size: 0.75rem;
+      color: #888;
+      text-align: center;
+    }
+    #room-link {
+      font-size: 0.75rem;
+      color: #aaa;
+      word-break: break-all;
+      text-align: center;
+    }
+    #room-link a { color: #f39c12; }
+  </style>
+</head>
+<body>
+  <h1>💣 BOMBERMAN</h1>
+
+  <div id="lobby">
+    <h2>Spiel beitreten</h2>
+    <div class="form-group">
+      <label>Dein Name</label>
+      <input type="text" id="playerName" placeholder="Spieler 1" maxlength="16">
+    </div>
+    <div class="form-group">
+      <label>Raum-ID (leer = Standard)</label>
+      <input type="text" id="roomId" placeholder="default" maxlength="20">
+    </div>
+    <button id="joinBtn" onclick="joinGame()">Beitreten</button>
+    <p style="margin-top:16px; color:#888; font-size:0.8rem;">
+      Teile die Raum-ID mit Freunden, um zusammen zu spielen!
+    </p>
+  </div>
+
+  <div id="game-container">
+    <div id="info-bar"></div>
+    <div id="canvas-wrapper">
+      <canvas id="gameCanvas"></canvas>
+      <div id="overlay">
+        <h2>Warte auf Spieler...</h2>
+        <p style="color:#aaa">Mindestens 2 Spieler benötigt</p>
+      </div>
+    </div>
+    <div id="controls-hint">
+      Steuerung: WASD / Pfeiltasten — Bombe: LEERTASTE
+    </div>
+    <div id="room-link"></div>
+  </div>
+
+  <script src="game.js"></script>
+</body>
+</html>
