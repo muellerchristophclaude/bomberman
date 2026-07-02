@@ -14,6 +14,7 @@ Vollständiges Spielkonzept: [docs/SHADOW_BOMBER_KONZEPT.md](docs/SHADOW_BOMBER_
 - **Laternen:** Feste Lichtquellen — zerstörbar, um die Arena strategisch zu verdunkeln
 - **Explosionsblitz:** Jede Explosion erhellt kurz die Umgebung — Aufklärung und Waffe zugleich
 - **Fair trotz Unsichtbarkeit:** Fußspuren, Bombenglühen in der letzten Sekunde und Geräusch-Richtungspfeile verraten versteckte Gegner
+- **Computer-Gegner:** 0–3 Bots pro Raum — sie jagen Spieler, sprengen Blöcke, sammeln Power-ups und fliehen vor Explosionen (serverseitige BFS-Pfadsuche mit Gefahrenkarte)
 - Mehrere Räume, zufällige Karten, Kettenreaktionen, Power-ups, Mobile-Touch-Controls
 
 ## Setup (lokal)
@@ -29,8 +30,10 @@ npm start
 
 1. Namen eingeben
 2. Raum-ID wählen (oder leer lassen für "default")
-3. Raum-ID mit Freunden teilen
-4. Spiel startet automatisch, wenn 2+ Spieler beigetreten sind
+3. Optional Computer-Gegner (1–3 Bots) auswählen — oder im Wartebildschirm
+   per Button hinzufügen
+4. Raum-ID mit Freunden teilen
+5. Spiel startet automatisch, wenn 2+ Spieler (Bots zählen mit) beigetreten sind
 
 ## Steuerung
 

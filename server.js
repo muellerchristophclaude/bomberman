@@ -137,7 +137,7 @@ function getRoom(roomId) {
 function broadcast(room, message, excludeId = null) {
   const data = JSON.stringify(message);
   room.players.forEach((player, id) => {
-    if (id !== excludeId && player.ws.readyState === WebSocket.OPEN) {
+    if (id !== excludeId && player.ws && player.ws.readyState === WebSocket.OPEN) {
       player.ws.send(data);
     }
   });
@@ -148,7 +148,7 @@ function broadcastAll(room, message) {
 }
 
 function sendTo(ws, message) {
-  if (ws.readyState === WebSocket.OPEN) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(message));
   }
 }
@@ -274,9 +274,209 @@ function buildSnapshot(room, viewer, now) {
   };
 }
 
+// ---- Computer opponents (bots) ----
+
+const BOT_NAMES = ['Schatten-Bot', 'Phantom-Bot', 'Geister-Bot'];
+const BOT_BASE_STEP = 0.22;   // tiles per tick at base speed
+const BOT_REPLAN_MS = 500;
+const BOT_BOMB_PAUSE_MS = 1500;
+
+function addBot(room) {
+  if (room.players.size >= MAX_PLAYERS) return false;
+  const id = room.nextPlayerId++;
+  const botCount = [...room.players.values()].filter(p => p.isBot).length;
+  const bot = {
+    id,
+    ws: null,
+    isBot: true,
+    name: `🤖 ${BOT_NAMES[botCount % BOT_NAMES.length]}`,
+    color: START_COLORS[id % START_COLORS.length],
+    path: [],
+    replanAt: 0,
+    bombPlacedAt: 0,
+  };
+  resetPlayer(bot, id);
+  room.players.set(id, bot);
+  return true;
+}
+
+// All cells a bomb would hit (same expansion rules as explodeBomb)
+function blastCells(room, bomb) {
+  const cells = [{ x: bomb.x, y: bomb.y }];
+  const directions = [[0, 1], [0, -1], [1, 0], [-1, 0]];
+  for (const [dx, dy] of directions) {
+    for (let i = 1; i <= bomb.flameSize; i++) {
+      const nx = bomb.x + dx * i;
+      const ny = bomb.y + dy * i;
+      if (nx < 0 || nx >= GRID_WIDTH || ny < 0 || ny >= GRID_HEIGHT) break;
+      if (room.map[ny][nx] === TILE_WALL) break;
+      cells.push({ x: nx, y: ny });
+      if (room.map[ny][nx] === TILE_BLOCK) break;
+    }
+  }
+  return cells;
+}
+
+// Set of "x,y" tiles currently threatened by bombs or active explosions
+function computeDanger(room, extraBomb = null) {
+  const danger = new Set();
+  const bombs = extraBomb ? [...room.bombs, extraBomb] : room.bombs;
+  bombs.forEach(b => blastCells(room, b).forEach(c => danger.add(c.x + ',' + c.y)));
+  room.explosions.forEach(e => e.cells.forEach(c => danger.add(c.x + ',' + c.y)));
+  return danger;
+}
+
+function isBotWalkable(room, x, y) {
+  if (x < 0 || x >= GRID_WIDTH || y < 0 || y >= GRID_HEIGHT) return false;
+  if (room.map[y][x] !== TILE_EMPTY) return false;
+  if (room.bombs.some(b => b.x === x && b.y === y)) return false;
+  return true;
+}
+
+// BFS on the tile grid; returns path (list of tiles, start excluded) or null
+function botBfs(room, sx, sy, isGoal, avoidDanger, maxDepth) {
+  const key = (x, y) => x + ',' + y;
+  const prev = new Map([[key(sx, sy), null]]);
+  const queue = [[sx, sy, 0]];
+  while (queue.length) {
+    const [cx, cy, d] = queue.shift();
+    if (isGoal(cx, cy)) {
+      const path = [];
+      let node = [cx, cy];
+      while (prev.get(key(node[0], node[1]))) {
+        path.unshift({ x: node[0], y: node[1] });
+        node = prev.get(key(node[0], node[1]));
+      }
+      return path;
+    }
+    if (d >= maxDepth) continue;
+    for (const [dx, dy] of [[0, 1], [0, -1], [1, 0], [-1, 0]]) {
+      const nx = cx + dx;
+      const ny = cy + dy;
+      const nk = key(nx, ny);
+      if (prev.has(nk)) continue;
+      if (!isBotWalkable(room, nx, ny)) continue;
+      if (avoidDanger && avoidDanger.has(nk)) continue;
+      prev.set(nk, [cx, cy]);
+      queue.push([nx, ny, d + 1]);
+    }
+  }
+  return null;
+}
+
+function nextToBlock(room, x, y) {
+  return [[0, 1], [0, -1], [1, 0], [-1, 0]].some(([dx, dy]) => {
+    const nx = x + dx;
+    const ny = y + dy;
+    return nx >= 0 && nx < GRID_WIDTH && ny >= 0 && ny < GRID_HEIGHT &&
+      room.map[ny][nx] === TILE_BLOCK;
+  });
+}
+
+function planBot(room, bot, now) {
+  const bx = Math.round(bot.x);
+  const by = Math.round(bot.y);
+  const danger = computeDanger(room);
+  bot.replanAt = now + BOT_REPLAN_MS;
+
+  // 1) Standing in a blast zone: flee to the nearest safe tile
+  //    (allowed to run through other danger tiles on the way out)
+  if (danger.has(bx + ',' + by)) {
+    bot.path = botBfs(room, bx, by, (x, y) => !danger.has(x + ',' + y), null, 15) || [];
+    return;
+  }
+
+  // Shadow-form players are invisible — bots don't target them either
+  const enemies = [...room.players.values()]
+    .filter(p => p.id !== bot.id && p.alive && !isShadowForm(p, now));
+
+  // 2) Drop a bomb when an enemy is in blast range or a block is adjacent,
+  //    but only if a safe escape route exists afterwards
+  const enemyInRange = enemies.some(p =>
+    (Math.round(p.x) === bx && Math.abs(p.y - by) <= bot.flameSize) ||
+    (Math.round(p.y) === by && Math.abs(p.x - bx) <= bot.flameSize));
+
+  if ((enemyInRange || nextToBlock(room, bx, by)) &&
+      bot.bombCount < bot.maxBombs && now - bot.bombPlacedAt > BOT_BOMB_PAUSE_MS) {
+    const dangerAfter = computeDanger(room, { x: bx, y: by, flameSize: bot.flameSize });
+    const escape = botBfs(room, bx, by, (x, y) => !dangerAfter.has(x + ',' + y), null, 10);
+    if (escape) {
+      placeBomb(room, bot);
+      bot.bombPlacedAt = now;
+      bot.path = escape;
+      return;
+    }
+  }
+
+  // 3) Grab a reachable power-up
+  if (room.powerups.length) {
+    const path = botBfs(room, bx, by,
+      (x, y) => room.powerups.some(pu => pu.x === x && pu.y === y), danger, 25);
+    if (path) { bot.path = path; return; }
+  }
+
+  // 4) Hunt the nearest reachable enemy
+  if (enemies.length) {
+    const path = botBfs(room, bx, by,
+      (x, y) => enemies.some(p => Math.round(p.x) === x && Math.round(p.y) === y),
+      danger, 40);
+    if (path) { bot.path = path; return; }
+  }
+
+  // 5) Otherwise walk next to a destructible block to blow it up
+  bot.path = botBfs(room, bx, by, (x, y) => nextToBlock(room, x, y), danger, 40) || [];
+}
+
+function updateBot(room, bot, now) {
+  if (!bot.alive || !room.gameStarted || room.gameOver) return;
+
+  const bx = Math.round(bot.x);
+  const by = Math.round(bot.y);
+  const danger = computeDanger(room);
+
+  if (danger.has(bx + ',' + by) || !bot.path.length || now >= bot.replanAt) {
+    planBot(room, bot, now);
+  }
+  if (!bot.path.length) return;
+
+  const target = bot.path[0];
+  // Don't voluntarily step into a blast zone; wait and replan instead
+  if (!danger.has(bx + ',' + by) && danger.has(target.x + ',' + target.y)) {
+    bot.path = [];
+    return;
+  }
+
+  const step = BOT_BASE_STEP * (bot.speed / 0.08);
+  const dx = target.x - bot.x;
+  const dy = target.y - bot.y;
+  const d = Math.hypot(dx, dy);
+  if (d <= step) {
+    bot.x = target.x;
+    bot.y = target.y;
+    bot.path.shift();
+  } else {
+    bot.x += (dx / d) * step;
+    bot.y += (dy / d) * step;
+  }
+  bot.lastActionAt = now;
+
+  // Bots leave footprints just like human players
+  const lf = bot.lastFootprint;
+  if (!lf || dist(lf.x, lf.y, bot.x, bot.y) >= FOOTPRINT_MIN_DIST) {
+    room.footprints.push({ x: bot.x, y: bot.y, t: now, playerId: bot.id });
+    bot.lastFootprint = { x: bot.x, y: bot.y };
+  }
+
+  collectPowerups(room, bot);
+}
+
 function tickRoom(room, now) {
   room.flashes = room.flashes.filter(f => f.until > now);
   room.footprints = room.footprints.filter(fp => now - fp.t < FOOTPRINT_LIFETIME);
+
+  room.players.forEach(p => {
+    if (p.isBot) updateBot(room, p, now);
+  });
 
   room.players.forEach(p => {
     if (!p.alive) return;
@@ -290,7 +490,7 @@ function tickRoom(room, now) {
   });
 
   room.players.forEach(p => {
-    sendTo(p.ws, buildSnapshot(room, p, now));
+    if (!p.isBot) sendTo(p.ws, buildSnapshot(room, p, now));
   });
 }
 
@@ -469,6 +669,11 @@ function resetPlayer(player, index) {
   player.inShadow = false;
   player.lastFootprint = null;
   player.lastActionAt = 0;
+  if (player.isBot) {
+    player.path = [];
+    player.replanAt = 0;
+    player.bombPlacedAt = 0;
+  }
 }
 
 wss.on('connection', (ws) => {
@@ -566,6 +771,19 @@ wss.on('connection', (ws) => {
         break;
       }
 
+      case 'addBot': {
+        if (!currentRoom || currentPlayerId === null) return;
+        if (addBot(currentRoom)) {
+          if (currentRoom.players.size >= 2 && !currentRoom.gameStarted) {
+            currentRoom.gameStarted = true;
+            broadcastAll(currentRoom, { type: 'gameStarted' });
+          }
+        } else {
+          sendTo(ws, { type: 'error', message: 'Raum ist voll!' });
+        }
+        break;
+      }
+
       case 'shadowForm': {
         if (!currentRoom || currentPlayerId === null) return;
         const player = currentRoom.players.get(currentPlayerId);
@@ -612,7 +830,9 @@ wss.on('connection', (ws) => {
     currentRoom.players.delete(currentPlayerId);
     broadcast(currentRoom, { type: 'playerLeft', playerId: currentPlayerId });
 
-    if (currentRoom.players.size === 0) {
+    // Bots alone don't keep a room alive
+    const humans = [...currentRoom.players.values()].filter(p => !p.isBot);
+    if (humans.length === 0) {
       rooms.delete(currentRoom.id);
     } else {
       checkGameOver(currentRoom);

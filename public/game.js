@@ -158,6 +158,12 @@ function sendShadowForm() {
   }
 }
 
+function sendAddBot() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'addBot' }));
+  }
+}
+
 // Smoothly move other players toward their latest snapshot position
 function interpolateOthers() {
   Object.values(others).forEach(o => {
@@ -717,10 +723,15 @@ function handleMessage(msg) {
           <h2>Warte auf Spieler...</h2>
           <p style="color:#aaa">Mindestens 2 Spieler benötigt</p>
           <p style="color:#888; font-size:0.85rem">Raum: ${roomId}</p>
+          <button onclick="sendAddBot()">🤖 Bot hinzufügen</button>
         `);
       } else {
         hideOverlay();
       }
+
+      // Bots aus der Lobby-Auswahl anfordern
+      const botCount = parseInt(document.getElementById('botCount').value, 10) || 0;
+      for (let i = 0; i < botCount; i++) sendAddBot();
 
       if (!animFrame) animFrame = requestAnimationFrame(gameLoop);
       break;
@@ -842,7 +853,7 @@ function handleMessage(msg) {
       footprints = [];
       resetSeen();
       if (gameStarted) hideOverlay();
-      else showOverlay('<h2>Warte auf Spieler...</h2>');
+      else showOverlay('<h2>Warte auf Spieler...</h2><button onclick="sendAddBot()">🤖 Bot hinzufügen</button>');
       break;
 
     case 'error':

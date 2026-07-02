@@ -46,6 +46,17 @@
       outline: none;
     }
     .form-group input:focus { border-color: #b48cff; }
+    .form-group select {
+      width: 100%;
+      padding: 10px 14px;
+      background: #1e1e3a;
+      border: 1px solid #3a2a6a;
+      border-radius: 6px;
+      color: #eee;
+      font-size: 1rem;
+      outline: none;
+    }
+    .form-group select:focus { border-color: #b48cff; }
     button {
       background: #9b59d0;
       color: #fff;
@@ -172,6 +183,15 @@
     <div class="form-group">
       <label>Raum-ID (leer = Standard)</label>
       <input type="text" id="roomId" placeholder="default" maxlength="20">
+    </div>
+    <div class="form-group">
+      <label>🤖 Computer-Gegner</label>
+      <select id="botCount">
+        <option value="0">Keine — nur menschliche Spieler</option>
+        <option value="1">1 Bot</option>
+        <option value="2">2 Bots</option>
+        <option value="3">3 Bots</option>
+      </select>
     </div>
     <button id="joinBtn" onclick="joinGame()">Beitreten</button>
     <p style="margin-top:16px; color:#888; font-size:0.8rem;">
