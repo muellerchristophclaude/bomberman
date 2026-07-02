@@ -1,8 +1,11 @@
 {
-  "name": "bomberman-multiplayer",
+  "name": "shadow-bomber",
   "version": "1.0.0",
-  "description": "Multiplayer Bomberman game with WebSockets",
+  "description": "Shadow Bomber - Multiplayer Bomberman with light/shadow mechanics",
   "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"
