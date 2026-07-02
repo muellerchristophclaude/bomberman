@@ -17,7 +17,7 @@ const BOMB_TIMER = 3000;
 const EXPLOSION_DURATION = 800;
 
 // Shadow system constants
-const SNAPSHOT_INTERVAL = 100; // 10 Hz per-player filtered snapshots
+const SNAPSHOT_INTERVAL = 50; // 20 Hz per-player filtered snapshots
 const LIGHT_RADIUS_BASE = 3;
 const LIGHT_RADIUS_MAX = 6;
 const LANTERN_RADIUS = 2.5;
@@ -277,7 +277,7 @@ function buildSnapshot(room, viewer, now) {
 // ---- Computer opponents (bots) ----
 
 const BOT_NAMES = ['Schatten-Bot', 'Phantom-Bot', 'Geister-Bot'];
-const BOT_BASE_STEP = 0.22;   // tiles per tick at base speed
+const BOT_BASE_STEP = 0.14;   // tiles per tick at base speed (~2.8 tiles/s at 20 Hz)
 const BOT_REPLAN_MS = 500;
 const BOT_BOMB_PAUSE_MS = 1500;
 
@@ -740,8 +740,9 @@ wss.on('connection', (ws) => {
         const now = Date.now();
         let { x, y } = msg;
         if (typeof x !== 'number' || typeof y !== 'number') return;
-        x = Math.max(0.5, Math.min(GRID_WIDTH - 1.5, x));
-        y = Math.max(0.5, Math.min(GRID_HEIGHT - 1.5, y));
+        // Keep the body fully inside the walkable area (border walls at 0 / max)
+        x = Math.max(1, Math.min(GRID_WIDTH - 2, x));
+        y = Math.max(1, Math.min(GRID_HEIGHT - 2, y));
 
         const phasing = isShadowForm(player, now);
         if (!checkCollision(currentRoom, x, y, phasing)) {

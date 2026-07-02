@@ -72,78 +72,116 @@ document.addEventListener('keydown', (e) => {
 document.addEventListener('keyup', (e) => { keys[e.key] = false; });
 
 let lastMoveTime = 0;
-const MOVE_INTERVAL = 50; // ms between move updates
+const MOVE_INTERVAL = 50;       // ms between network position updates
+const BASE_TILES_PER_SEC = 4.5; // base movement speed (scaled by speed power-up)
+const BODY_MARGIN = 0.4;        // leading-edge distance for wall collision
+
+let lastFrameTs = 0;
 
 function gameLoop(ts) {
   animFrame = requestAnimationFrame(gameLoop);
 
-  if (ts - lastMoveTime > MOVE_INTERVAL && myId !== null) {
-    handleMovement();
-    lastMoveTime = ts;
-  }
+  const dt = lastFrameTs ? Math.min(0.05, (ts - lastFrameTs) / 1000) : 0;
+  lastFrameTs = ts;
 
-  interpolateOthers();
+  if (myId !== null && dt > 0) handleMovement(dt, ts);
+  interpolateOthers(dt);
   updateSeenTiles();
   render();
   updateShadowMeterUI();
 }
 
-function handleMovement() {
-  if (!me.alive || !gameStarted || !meSpawned) return;
-
-  const speed = (me.speed || 0.08) * (me.shadowForm ? SHADOW_SPEED_BOOST : 1);
-  let dx = 0, dy = 0;
-
-  for (const [key, [kx, ky]] of Object.entries(moveKeys)) {
-    if (keys[key]) { dx += kx; dy += ky; }
-  }
-
-  if (dx === 0 && dy === 0) return;
-
-  // Normalize diagonal
-  if (dx !== 0 && dy !== 0) {
-    dx *= 0.707;
-    dy *= 0.707;
-  }
-
-  let nx = me.x + dx * speed * 12;
-  let ny = me.y + dy * speed * 12;
-  nx = Math.max(0.5, Math.min(GRID_WIDTH - 1.5, nx));
-  ny = Math.max(0.5, Math.min(GRID_HEIGHT - 1.5, ny));
-
-  if (!checkLocalCollision(nx, ny)) {
-    moveTo(nx, ny);
-  } else {
-    // Try sliding along walls
-    const nx2 = me.x + dx * speed * 12;
-    if (!checkLocalCollision(nx2, me.y)) {
-      moveTo(nx2, me.y);
-    } else {
-      const ny2 = me.y + dy * speed * 12;
-      if (!checkLocalCollision(me.x, ny2)) {
-        moveTo(me.x, ny2);
-      }
-    }
-  }
-}
-
-function moveTo(x, y) {
-  me.x = x;
-  me.y = y;
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'move', x, y }));
-  }
-}
-
-function checkLocalCollision(x, y) {
-  const tileX = Math.round(x);
-  const tileY = Math.round(y);
-  if (tileX < 0 || tileX >= GRID_WIDTH || tileY < 0 || tileY >= GRID_HEIGHT) return true;
-  if (!map[tileY]) return true;
-  const tile = map[tileY][tileX];
+function blockedTile(tx, ty) {
+  if (tx < 0 || tx >= GRID_WIDTH || ty < 0 || ty >= GRID_HEIGHT) return true;
+  if (!map[ty]) return true;
+  const tile = map[ty][tx];
   if (tile === TILE_WALL) return true;
   if (tile === TILE_BLOCK) return !me.shadowForm; // shadow form glides through blocks
   return false;
+}
+
+function blockedAt(x, y) {
+  return blockedTile(Math.round(x), Math.round(y));
+}
+
+const clampX = (x) => Math.max(1, Math.min(GRID_WIDTH - 2, x));
+const clampY = (y) => Math.max(1, Math.min(GRID_HEIGHT - 2, y));
+
+function handleMovement(dt, ts) {
+  if (!me.alive || !gameStarted || !meSpawned) return;
+
+  let dx = 0, dy = 0;
+  for (const [key, [kx, ky]] of Object.entries(moveKeys)) {
+    if (keys[key]) { dx += kx; dy += ky; }
+  }
+  dx = Math.sign(dx);
+  dy = Math.sign(dy);
+  if (dx === 0 && dy === 0) return;
+
+  const spd = BASE_TILES_PER_SEC * ((me.speed || 0.08) / 0.08) * (me.shadowForm ? SHADOW_SPEED_BOOST : 1);
+  let step = spd * dt;
+  if (dx !== 0 && dy !== 0) step *= 0.707;
+
+  const oldX = me.x, oldY = me.y;
+  const col = Math.round(me.x);
+  const row = Math.round(me.y);
+  let assisted = false; // corner assist and lane centering must not fight
+
+  // X axis with leading-edge collision
+  if (dx !== 0) {
+    const nx = clampX(me.x + dx * step);
+    if (!blockedAt(nx + dx * BODY_MARGIN, me.y)) {
+      me.x = nx;
+    } else if (dy === 0) {
+      // Corner assist: slide toward an adjacent open row
+      const prefer = Math.sign(me.y - row) || 1;
+      for (const side of [prefer, -prefer]) {
+        const r = row + side;
+        if (!blockedTile(col, r) && !blockedTile(col + dx, r)) {
+          me.y = clampY(me.y + side * step);
+          assisted = true;
+          break;
+        }
+      }
+    }
+  }
+
+  // Y axis with leading-edge collision
+  if (dy !== 0) {
+    const ny = clampY(me.y + dy * step);
+    if (!blockedAt(me.x, ny + dy * BODY_MARGIN)) {
+      me.y = ny;
+    } else if (dx === 0) {
+      // Corner assist: slide toward an adjacent open column
+      const prefer = Math.sign(me.x - col) || 1;
+      for (const side of [prefer, -prefer]) {
+        const c = col + side;
+        if (!blockedTile(c, row) && !blockedTile(c, row + dy)) {
+          me.x = clampX(me.x + side * step);
+          assisted = true;
+          break;
+        }
+      }
+    }
+  }
+
+  // Lane centering: while walking along one axis, drift to the middle
+  // of the corridor so the character stays aligned with the grid
+  if (!assisted) {
+    if (dx !== 0 && dy === 0 && me.y !== row) {
+      me.y += Math.max(-step, Math.min(step, Math.round(me.y) - me.y));
+    } else if (dy !== 0 && dx === 0 && me.x !== col) {
+      me.x += Math.max(-step, Math.min(step, Math.round(me.x) - me.x));
+    }
+  }
+
+  // Rate-limited network update, movement itself stays per-frame smooth
+  if ((me.x !== oldX || me.y !== oldY) && ts - lastMoveTime > MOVE_INTERVAL) {
+    lastMoveTime = ts;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'move', x: me.x, y: me.y }));
+    }
+  }
 }
 
 function sendBomb() {
@@ -165,10 +203,12 @@ function sendAddBot() {
 }
 
 // Smoothly move other players toward their latest snapshot position
-function interpolateOthers() {
+// (exponential smoothing, frame-rate independent)
+function interpolateOthers(dt) {
+  const f = 1 - Math.exp(-14 * dt);
   Object.values(others).forEach(o => {
-    o.x += (o.tx - o.x) * 0.35;
-    o.y += (o.ty - o.y) * 0.35;
+    o.x += (o.tx - o.x) * f;
+    o.y += (o.ty - o.y) * f;
   });
 }
 
