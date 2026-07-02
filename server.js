@@ -445,6 +445,12 @@ function updateBot(room, bot, now) {
     bot.path = [];
     return;
   }
+  // A bomb may have appeared on the path since planning — bombs are solid
+  if (!(target.x === bx && target.y === by) &&
+      room.bombs.some(b => b.x === target.x && b.y === target.y)) {
+    bot.path = [];
+    return;
+  }
 
   const step = BOT_BASE_STEP * (bot.speed / 0.08);
   const dx = target.x - bot.x;
@@ -503,13 +509,17 @@ setInterval(() => {
 
 // ---- Core game logic ----
 
-function checkCollision(room, x, y, phasing) {
+function checkCollision(room, x, y, phasing, fromTileX = null, fromTileY = null) {
   const tileX = Math.round(x);
   const tileY = Math.round(y);
   if (tileX < 0 || tileX >= GRID_WIDTH || tileY < 0 || tileY >= GRID_HEIGHT) return true;
   const tile = room.map[tileY][tileX];
   if (tile === TILE_WALL) return true;
   if (tile === TILE_BLOCK) return !phasing; // shadow form slips through blocks
+  // Bombs are solid unless it's the tile the player is already on
+  if (!phasing && !(tileX === fromTileX && tileY === fromTileY)) {
+    if (room.bombs.some(b => b.x === tileX && b.y === tileY)) return true;
+  }
   return false;
 }
 
@@ -745,7 +755,7 @@ wss.on('connection', (ws) => {
         y = Math.max(1, Math.min(GRID_HEIGHT - 2, y));
 
         const phasing = isShadowForm(player, now);
-        if (!checkCollision(currentRoom, x, y, phasing)) {
+        if (!checkCollision(currentRoom, x, y, phasing, Math.round(player.x), Math.round(player.y))) {
           player.x = x;
           player.y = y;
           player.lastActionAt = now;
@@ -760,6 +770,10 @@ wss.on('connection', (ws) => {
           }
 
           collectPowerups(currentRoom, player);
+        } else {
+          // Client ran into something it can't see (e.g. a bomb in the dark):
+          // snap it back to the last valid server position
+          sendTo(ws, { type: 'moveCorrection', x: player.x, y: player.y });
         }
         break;
       }

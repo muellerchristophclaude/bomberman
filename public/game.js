@@ -97,6 +97,12 @@ function blockedTile(tx, ty) {
   const tile = map[ty][tx];
   if (tile === TILE_WALL) return true;
   if (tile === TILE_BLOCK) return !me.shadowForm; // shadow form glides through blocks
+  // Bombs are solid — except the tile we're standing on (so you can
+  // step off a freshly placed bomb) and while in shadow form
+  if (!me.shadowForm && !(Math.round(me.x) === tx && Math.round(me.y) === ty)) {
+    if (bombs.some(b => b.x === tx && b.y === ty)) return true;
+    if (glows.some(g => g.x === tx && g.y === ty)) return true;
+  }
   return false;
 }
 
@@ -818,6 +824,11 @@ function handleMessage(msg) {
       updateInfoBar();
       break;
     }
+
+    case 'moveCorrection':
+      me.x = msg.x;
+      me.y = msg.y;
+      break;
 
     case 'playerLeft':
       delete roster[msg.playerId];
