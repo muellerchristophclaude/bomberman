@@ -7,32 +7,46 @@ const TILE_EMPTY = 0;
 const TILE_WALL = 1;
 const TILE_BLOCK = 2;
 
+const LANTERN_RADIUS = 2.5;
+const SHADOW_SPEED_BOOST = 1.3;
+
 // Color palette
 const COLORS = {
-  bg: '#1a1a2e',
-  empty: '#2d2d4e',
+  empty: '#22223c',
   wall: '#0f3460',
   block: '#8B6914',
   blockHighlight: '#c49a1e',
   blockShadow: '#5a4208',
-  explosion: '#ff6b35',
-  explosionCenter: '#ffffff',
-  flame: '#ff4500',
 };
 
 // State
 let ws = null;
 let myId = null;
-let gameState = {
-  players: {},
-  bombs: [],
-  explosions: [],
-  powerups: [],
-  map: [],
-  gameStarted: false,
-  gameOver: false,
+let map = [];
+let seen = []; // memory fog: tiles the player has seen at least once
+let gameStarted = false;
+let gameOver = false;
+
+// Own player (client-side movement, server-verified)
+let me = {
+  x: 1, y: 1, alive: true, speed: 0.08,
+  lightRadius: 3, shadowMeter: 0, shadowForm: false,
+  cooldownMs: 0, inShadow: false,
 };
-let myPlayer = null;
+let meSpawned = false;
+
+// Server-filtered snapshot data
+let roster = {};
+let others = {}; // id -> { x, y, tx, ty, color, name, lastSeen }
+let bombs = [];
+let glows = [];
+let powerups = [];
+let footprints = [];
+let lanterns = [];
+let flashes = [];
+let noises = [];
+let explosions = [];
+
 let animFrame = null;
 let keys = {};
 
@@ -44,6 +58,10 @@ const moveKeys = {
 };
 
 document.addEventListener('keydown', (e) => {
+  if (e.key === 'Shift' || e.key === 'e' || e.key === 'E') {
+    sendShadowForm();
+    return;
+  }
   if (keys[e.key]) return;
   keys[e.key] = true;
   if (e.key === ' ') {
@@ -64,14 +82,16 @@ function gameLoop(ts) {
     lastMoveTime = ts;
   }
 
+  interpolateOthers();
+  updateSeenTiles();
   render();
+  updateShadowMeterUI();
 }
 
 function handleMovement() {
-  const player = gameState.players[myId];
-  if (!player || !player.alive || !gameState.gameStarted) return;
+  if (!me.alive || !gameStarted || !meSpawned) return;
 
-  const speed = player.speed || 0.08;
+  const speed = (me.speed || 0.08) * (me.shadowForm ? SHADOW_SPEED_BOOST : 1);
   let dx = 0, dy = 0;
 
   for (const [key, [kx, ky]] of Object.entries(moveKeys)) {
@@ -86,30 +106,32 @@ function handleMovement() {
     dy *= 0.707;
   }
 
-  let nx = player.x + dx * speed * 12;
-  let ny = player.y + dy * speed * 12;
+  let nx = me.x + dx * speed * 12;
+  let ny = me.y + dy * speed * 12;
   nx = Math.max(0.5, Math.min(GRID_WIDTH - 1.5, nx));
   ny = Math.max(0.5, Math.min(GRID_HEIGHT - 1.5, ny));
 
   if (!checkLocalCollision(nx, ny)) {
-    player.x = nx;
-    player.y = ny;
-    ws.send(JSON.stringify({ type: 'move', x: nx, y: ny }));
+    moveTo(nx, ny);
   } else {
     // Try sliding along walls
-    const nx2 = player.x + dx * speed * 12;
-    if (!checkLocalCollision(nx2, player.y)) {
-      player.x = nx2;
-      player.y = player.y;
-      ws.send(JSON.stringify({ type: 'move', x: nx2, y: player.y }));
+    const nx2 = me.x + dx * speed * 12;
+    if (!checkLocalCollision(nx2, me.y)) {
+      moveTo(nx2, me.y);
     } else {
-      const ny2 = player.y + dy * speed * 12;
-      if (!checkLocalCollision(player.x, ny2)) {
-        player.x = player.x;
-        player.y = ny2;
-        ws.send(JSON.stringify({ type: 'move', x: player.x, y: ny2 }));
+      const ny2 = me.y + dy * speed * 12;
+      if (!checkLocalCollision(me.x, ny2)) {
+        moveTo(me.x, ny2);
       }
     }
+  }
+}
+
+function moveTo(x, y) {
+  me.x = x;
+  me.y = y;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'move', x, y }));
   }
 }
 
@@ -117,13 +139,56 @@ function checkLocalCollision(x, y) {
   const tileX = Math.round(x);
   const tileY = Math.round(y);
   if (tileX < 0 || tileX >= GRID_WIDTH || tileY < 0 || tileY >= GRID_HEIGHT) return true;
-  if (!gameState.map[tileY]) return true;
-  return gameState.map[tileY][tileX] !== TILE_EMPTY;
+  if (!map[tileY]) return true;
+  const tile = map[tileY][tileX];
+  if (tile === TILE_WALL) return true;
+  if (tile === TILE_BLOCK) return !me.shadowForm; // shadow form glides through blocks
+  return false;
 }
 
 function sendBomb() {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'placeBomb' }));
+  }
+}
+
+function sendShadowForm() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'shadowForm' }));
+  }
+}
+
+// Smoothly move other players toward their latest snapshot position
+function interpolateOthers() {
+  Object.values(others).forEach(o => {
+    o.x += (o.tx - o.x) * 0.35;
+    o.y += (o.ty - o.y) * 0.35;
+  });
+}
+
+// ---- Memory fog ----
+function resetSeen() {
+  seen = [];
+  for (let y = 0; y < GRID_HEIGHT; y++) seen[y] = new Array(GRID_WIDTH).fill(false);
+}
+resetSeen();
+
+function updateSeenTiles() {
+  if (!meSpawned) return;
+  const sources = [{ x: me.x, y: me.y, r: me.lightRadius }];
+  lanterns.forEach(l => { if (l.alive) sources.push({ x: l.x, y: l.y, r: LANTERN_RADIUS }); });
+  flashes.forEach(f => sources.push({ x: f.x, y: f.y, r: f.r }));
+
+  for (const s of sources) {
+    const minX = Math.max(0, Math.floor(s.x - s.r));
+    const maxX = Math.min(GRID_WIDTH - 1, Math.ceil(s.x + s.r));
+    const minY = Math.max(0, Math.floor(s.y - s.r));
+    const maxY = Math.min(GRID_HEIGHT - 1, Math.ceil(s.y + s.r));
+    for (let y = minY; y <= maxY; y++) {
+      for (let x = minX; x <= maxX; x++) {
+        if (Math.hypot(x - s.x, y - s.y) <= s.r + 0.5) seen[y][x] = true;
+      }
+    }
   }
 }
 
@@ -133,15 +198,27 @@ const ctx = canvas.getContext('2d');
 canvas.width = GRID_WIDTH * CELL_SIZE;
 canvas.height = GRID_HEIGHT * CELL_SIZE;
 
+// Offscreen darkness layer
+const darkCanvas = document.createElement('canvas');
+darkCanvas.width = canvas.width;
+darkCanvas.height = canvas.height;
+const darkCtx = darkCanvas.getContext('2d');
+
 function render() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  if (!gameState.map.length) return;
+  if (!map.length) return;
 
   drawMap();
+  drawFootprints();
   drawPowerups();
+  drawLanterns();
   drawBombs();
+  drawGlows();
   drawExplosions();
   drawPlayers();
+  drawDarkness();
+  drawUnseen();
+  drawNoiseIndicators();
 }
 
 function drawMap() {
@@ -149,20 +226,17 @@ function drawMap() {
     for (let x = 0; x < GRID_WIDTH; x++) {
       const px = x * CELL_SIZE;
       const py = y * CELL_SIZE;
-      const tile = gameState.map[y] ? gameState.map[y][x] : 0;
+      const tile = map[y] ? map[y][x] : 0;
 
       if (tile === TILE_WALL) {
-        // Stone wall
         ctx.fillStyle = '#1c3a6b';
         ctx.fillRect(px, py, CELL_SIZE, CELL_SIZE);
         ctx.fillStyle = '#0d2445';
         ctx.fillRect(px + 2, py + 2, CELL_SIZE - 4, CELL_SIZE - 4);
-        // Highlight
         ctx.fillStyle = '#2a5299';
         ctx.fillRect(px + 2, py + 2, CELL_SIZE - 4, 3);
         ctx.fillRect(px + 2, py + 2, 3, CELL_SIZE - 4);
       } else if (tile === TILE_BLOCK) {
-        // Destructible block
         ctx.fillStyle = COLORS.block;
         ctx.fillRect(px, py, CELL_SIZE, CELL_SIZE);
         ctx.fillStyle = COLORS.blockHighlight;
@@ -172,11 +246,9 @@ function drawMap() {
         ctx.fillRect(px + 2, py + CELL_SIZE - 6, CELL_SIZE - 4, 4);
         ctx.fillRect(px + CELL_SIZE - 6, py + 2, 4, CELL_SIZE - 4);
       } else {
-        // Floor
         ctx.fillStyle = COLORS.empty;
         ctx.fillRect(px, py, CELL_SIZE, CELL_SIZE);
-        // Grid lines
-        ctx.strokeStyle = '#252545';
+        ctx.strokeStyle = '#1b1b33';
         ctx.lineWidth = 0.5;
         ctx.strokeRect(px, py, CELL_SIZE, CELL_SIZE);
       }
@@ -184,8 +256,58 @@ function drawMap() {
   }
 }
 
+function drawFootprints() {
+  footprints.forEach(fp => {
+    const alpha = Math.max(0, 1 - fp.age / 2500) * 0.5;
+    ctx.fillStyle = `rgba(200, 200, 255, ${alpha})`;
+    ctx.beginPath();
+    ctx.ellipse(fp.x * CELL_SIZE + CELL_SIZE / 2, fp.y * CELL_SIZE + CELL_SIZE / 2, 5, 8, 0, 0, Math.PI * 2);
+    ctx.fill();
+  });
+}
+
+function drawLanterns() {
+  lanterns.forEach(l => {
+    const px = l.x * CELL_SIZE + CELL_SIZE / 2;
+    const py = l.y * CELL_SIZE + CELL_SIZE / 2;
+
+    ctx.save();
+    ctx.translate(px, py);
+
+    // Post
+    ctx.fillStyle = l.alive ? '#5a4a3a' : '#3a3a3a';
+    ctx.fillRect(-3, -4, 6, 16);
+
+    if (l.alive) {
+      // Warm glow
+      const grd = ctx.createRadialGradient(0, -8, 0, 0, -8, 18);
+      grd.addColorStop(0, 'rgba(255, 200, 100, 0.7)');
+      grd.addColorStop(1, 'transparent');
+      ctx.fillStyle = grd;
+      ctx.fillRect(-18, -26, 36, 36);
+
+      ctx.fillStyle = '#ffcf70';
+      ctx.beginPath();
+      ctx.arc(0, -8, 7, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#8a6a30';
+    } else {
+      // Broken lantern
+      ctx.fillStyle = '#222';
+      ctx.beginPath();
+      ctx.arc(0, -8, 7, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#444';
+    }
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    ctx.restore();
+  });
+}
+
 function drawPowerups() {
-  gameState.powerups.forEach(pu => {
+  powerups.forEach(pu => {
     const px = pu.x * CELL_SIZE + CELL_SIZE / 2;
     const py = pu.y * CELL_SIZE + CELL_SIZE / 2;
     const r = CELL_SIZE * 0.3;
@@ -193,34 +315,33 @@ function drawPowerups() {
     ctx.save();
     ctx.translate(px, py);
 
-    // Glow
+    const glowColors = {
+      bomb: 'rgba(255,100,50,0.4)',
+      flame: 'rgba(255,200,0,0.4)',
+      speed: 'rgba(100,255,100,0.4)',
+      torch: 'rgba(180,140,255,0.5)',
+    };
     const grd = ctx.createRadialGradient(0, 0, 0, 0, 0, r + 6);
-    if (pu.type === 'bomb') {
-      grd.addColorStop(0, 'rgba(255,100,50,0.4)');
-      grd.addColorStop(1, 'transparent');
-    } else if (pu.type === 'flame') {
-      grd.addColorStop(0, 'rgba(255,200,0,0.4)');
-      grd.addColorStop(1, 'transparent');
-    } else {
-      grd.addColorStop(0, 'rgba(100,255,100,0.4)');
-      grd.addColorStop(1, 'transparent');
-    }
+    grd.addColorStop(0, glowColors[pu.type] || 'rgba(255,255,255,0.3)');
+    grd.addColorStop(1, 'transparent');
     ctx.fillStyle = grd;
     ctx.fillRect(-r - 6, -r - 6, (r + 6) * 2, (r + 6) * 2);
 
+    const fillColors = { bomb: '#ff6432', flame: '#ffc800', speed: '#64ff64', torch: '#b48cff' };
     ctx.beginPath();
     ctx.arc(0, 0, r, 0, Math.PI * 2);
-    ctx.fillStyle = pu.type === 'bomb' ? '#ff6432' : pu.type === 'flame' ? '#ffc800' : '#64ff64';
+    ctx.fillStyle = fillColors[pu.type] || '#ccc';
     ctx.fill();
     ctx.strokeStyle = 'rgba(255,255,255,0.6)';
     ctx.lineWidth = 2;
     ctx.stroke();
 
+    const icons = { bomb: '💣', flame: '🔥', speed: '👟', torch: '🔦' };
     ctx.fillStyle = '#fff';
     ctx.font = `bold ${r * 1.1}px serif`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(pu.type === 'bomb' ? '💣' : pu.type === 'flame' ? '🔥' : '👟', 0, 0);
+    ctx.fillText(icons[pu.type] || '?', 0, 0);
 
     ctx.restore();
   });
@@ -228,7 +349,7 @@ function drawPowerups() {
 
 function drawBombs() {
   const t = Date.now();
-  gameState.bombs.forEach(bomb => {
+  bombs.forEach(bomb => {
     const px = bomb.x * CELL_SIZE + CELL_SIZE / 2;
     const py = bomb.y * CELL_SIZE + CELL_SIZE / 2;
     const pulse = Math.sin(t / 200) * 0.15 + 0.85;
@@ -237,13 +358,11 @@ function drawBombs() {
     ctx.save();
     ctx.translate(px, py);
 
-    // Shadow
     ctx.fillStyle = 'rgba(0,0,0,0.4)';
     ctx.beginPath();
     ctx.ellipse(3, 6, r * 0.8, r * 0.4, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // Body
     ctx.beginPath();
     ctx.arc(0, 0, r, 0, Math.PI * 2);
     ctx.fillStyle = '#111';
@@ -252,13 +371,11 @@ function drawBombs() {
     ctx.lineWidth = 2;
     ctx.stroke();
 
-    // Shine
     ctx.beginPath();
     ctx.arc(-r * 0.3, -r * 0.3, r * 0.25, 0, Math.PI * 2);
     ctx.fillStyle = 'rgba(255,255,255,0.2)';
     ctx.fill();
 
-    // Fuse
     ctx.strokeStyle = '#8B6914';
     ctx.lineWidth = 2;
     ctx.beginPath();
@@ -266,7 +383,6 @@ function drawBombs() {
     ctx.quadraticCurveTo(r * 0.8, -r * 1.2, r * 0.3, -r * 1.5);
     ctx.stroke();
 
-    // Spark
     ctx.fillStyle = '#ff0';
     ctx.beginPath();
     ctx.arc(r * 0.3, -r * 1.5, 3, 0, Math.PI * 2);
@@ -276,13 +392,30 @@ function drawBombs() {
   });
 }
 
+// Bombs hidden in darkness betray themselves with a faint ember during the last second
+function drawGlows() {
+  const t = Date.now();
+  glows.forEach(g => {
+    const px = g.x * CELL_SIZE + CELL_SIZE / 2;
+    const py = g.y * CELL_SIZE + CELL_SIZE / 2;
+    const intensity = 1 - Math.max(0, g.remaining) / 1000; // brighter as timer runs out
+    const flicker = Math.sin(t / 60) * 0.2 + 0.8;
+    const alpha = (0.25 + intensity * 0.6) * flicker;
+
+    const grd = ctx.createRadialGradient(px, py, 0, px, py, 10 + intensity * 8);
+    grd.addColorStop(0, `rgba(255, 120, 30, ${alpha})`);
+    grd.addColorStop(1, 'transparent');
+    ctx.fillStyle = grd;
+    ctx.fillRect(px - 20, py - 20, 40, 40);
+  });
+}
+
 function drawExplosions() {
-  gameState.explosions.forEach(exp => {
+  explosions.forEach(exp => {
     exp.cells.forEach(cell => {
       const px = cell.x * CELL_SIZE;
       const py = cell.y * CELL_SIZE;
 
-      // Outer glow
       const grd = ctx.createRadialGradient(
         px + CELL_SIZE / 2, py + CELL_SIZE / 2, 0,
         px + CELL_SIZE / 2, py + CELL_SIZE / 2, CELL_SIZE * 0.8
@@ -298,74 +431,175 @@ function drawExplosions() {
   });
 }
 
-function drawPlayers() {
-  Object.values(gameState.players).forEach(player => {
-    if (!player.alive) return;
+function drawPlayerBody(player, isMe) {
+  const cx = player.x * CELL_SIZE + CELL_SIZE / 2;
+  const cy = player.y * CELL_SIZE + CELL_SIZE / 2;
+  const r = CELL_SIZE * 0.38;
 
-    const px = player.x * CELL_SIZE;
-    const py = player.y * CELL_SIZE;
-    const cx = px + CELL_SIZE / 2;
-    const cy = py + CELL_SIZE / 2;
-    const r = CELL_SIZE * 0.38;
+  ctx.save();
+  ctx.translate(cx, cy);
+
+  if (isMe && me.shadowForm) {
+    ctx.globalAlpha = 0.45;
+  }
+
+  // Shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.beginPath();
+  ctx.ellipse(3, r * 0.7, r * 0.7, r * 0.3, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Body
+  ctx.beginPath();
+  ctx.arc(0, 0, r, 0, Math.PI * 2);
+  ctx.fillStyle = isMe && me.shadowForm ? '#3a2a5a' : player.color;
+  ctx.fill();
+  ctx.strokeStyle = isMe && me.shadowForm ? '#b48cff' : 'rgba(255,255,255,0.5)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Face shine
+  ctx.beginPath();
+  ctx.arc(-r * 0.25, -r * 0.25, r * 0.22, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(255,255,255,0.3)';
+  ctx.fill();
+
+  // Eyes
+  ctx.fillStyle = isMe && me.shadowForm ? '#b48cff' : '#fff';
+  ctx.beginPath();
+  ctx.arc(-r * 0.25, -r * 0.1, r * 0.15, 0, Math.PI * 2);
+  ctx.arc(r * 0.25, -r * 0.1, r * 0.15, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = '#222';
+  ctx.beginPath();
+  ctx.arc(-r * 0.22, -r * 0.08, r * 0.08, 0, Math.PI * 2);
+  ctx.arc(r * 0.27, -r * 0.08, r * 0.08, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Name label
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.font = '11px monospace';
+  const nameW = ctx.measureText(player.name).width + 8;
+  ctx.fillRect(-nameW / 2, -r - 20, nameW, 16);
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(player.name, 0, -r - 12);
+
+  // "ME" indicator
+  if (isMe) {
+    ctx.strokeStyle = me.shadowForm ? '#b48cff' : '#fff';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.arc(0, 0, r + 5, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  ctx.restore();
+}
+
+function drawPlayers() {
+  Object.values(others).forEach(o => drawPlayerBody(o, false));
+  if (meSpawned && me.alive) {
+    drawPlayerBody({ x: me.x, y: me.y, color: roster[myId] ? roster[myId].color : '#fff', name: roster[myId] ? roster[myId].name : '' }, true);
+  }
+}
+
+// Darkness layer: black overlay with light holes punched out
+function drawDarkness() {
+  darkCtx.globalCompositeOperation = 'source-over';
+  darkCtx.clearRect(0, 0, darkCanvas.width, darkCanvas.height);
+  darkCtx.fillStyle = 'rgba(0, 0, 5, 0.92)';
+  darkCtx.fillRect(0, 0, darkCanvas.width, darkCanvas.height);
+
+  darkCtx.globalCompositeOperation = 'destination-out';
+
+  const punch = (x, y, r, softness = 0.5) => {
+    const px = x * CELL_SIZE + CELL_SIZE / 2;
+    const py = y * CELL_SIZE + CELL_SIZE / 2;
+    const pr = r * CELL_SIZE;
+    const grd = darkCtx.createRadialGradient(px, py, 0, px, py, pr);
+    grd.addColorStop(0, 'rgba(0,0,0,1)');
+    grd.addColorStop(softness, 'rgba(0,0,0,0.9)');
+    grd.addColorStop(1, 'rgba(0,0,0,0)');
+    darkCtx.fillStyle = grd;
+    darkCtx.fillRect(px - pr, py - pr, pr * 2, pr * 2);
+  };
+
+  if (meSpawned && me.alive) punch(me.x, me.y, me.lightRadius);
+  if (!me.alive) {
+    // Spectators see everything dimly — punch a huge hole
+    punch(GRID_WIDTH / 2, GRID_HEIGHT / 2, GRID_WIDTH);
+  }
+  lanterns.forEach(l => { if (l.alive) punch(l.x, l.y, LANTERN_RADIUS, 0.4); });
+  flashes.forEach(f => {
+    const fade = Math.min(1, Math.max(0, f.remaining / 1500));
+    const px = f.x * CELL_SIZE + CELL_SIZE / 2;
+    const py = f.y * CELL_SIZE + CELL_SIZE / 2;
+    const pr = f.r * CELL_SIZE;
+    const grd = darkCtx.createRadialGradient(px, py, 0, px, py, pr);
+    grd.addColorStop(0, `rgba(0,0,0,${fade})`);
+    grd.addColorStop(1, 'rgba(0,0,0,0)');
+    darkCtx.fillStyle = grd;
+    darkCtx.fillRect(px - pr, py - pr, pr * 2, pr * 2);
+  });
+  explosions.forEach(exp => exp.cells.forEach(c => punch(c.x, c.y, 1.5)));
+  glows.forEach(g => punch(g.x, g.y, 0.5));
+
+  ctx.drawImage(darkCanvas, 0, 0);
+}
+
+// Tiles never seen are pitch black (memory fog)
+function drawUnseen() {
+  if (!me.alive) return; // spectators see the whole map
+  ctx.fillStyle = '#000005';
+  for (let y = 0; y < GRID_HEIGHT; y++) {
+    for (let x = 0; x < GRID_WIDTH; x++) {
+      if (!seen[y][x]) {
+        ctx.fillRect(x * CELL_SIZE, y * CELL_SIZE, CELL_SIZE, CELL_SIZE);
+      }
+    }
+  }
+}
+
+// Direction hints for invisible enemies moving nearby
+const NOISE_ANGLES = {
+  E: 0, SE: Math.PI / 4, S: Math.PI / 2, SW: (3 * Math.PI) / 4,
+  W: Math.PI, NW: (5 * Math.PI) / 4, N: (3 * Math.PI) / 2, NE: (7 * Math.PI) / 4,
+};
+
+function drawNoiseIndicators() {
+  if (!noises.length || !me.alive) return;
+  const t = Date.now();
+  const pulse = Math.sin(t / 150) * 0.3 + 0.7;
+  const cx = canvas.width / 2;
+  const cy = canvas.height / 2;
+  const rx = canvas.width / 2 - 24;
+  const ry = canvas.height / 2 - 24;
+
+  noises.forEach(dir => {
+    const angle = NOISE_ANGLES[dir];
+    if (angle === undefined) return;
+    const x = cx + Math.cos(angle) * rx;
+    const y = cy + Math.sin(angle) * ry;
 
     ctx.save();
-    ctx.translate(cx, cy);
-
-    // Shadow
-    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.translate(x, y);
+    ctx.rotate(angle);
+    ctx.globalAlpha = pulse;
+    ctx.fillStyle = '#ff5555';
     ctx.beginPath();
-    ctx.ellipse(3, r * 0.7, r * 0.7, r * 0.3, 0, 0, Math.PI * 2);
+    ctx.moveTo(14, 0);
+    ctx.lineTo(-6, -9);
+    ctx.lineTo(-6, 9);
+    ctx.closePath();
     ctx.fill();
-
-    // Body
-    ctx.beginPath();
-    ctx.arc(0, 0, r, 0, Math.PI * 2);
-    ctx.fillStyle = player.color;
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
-    ctx.lineWidth = 2;
-    ctx.stroke();
-
-    // Face shine
-    ctx.beginPath();
-    ctx.arc(-r * 0.25, -r * 0.25, r * 0.22, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(255,255,255,0.3)';
-    ctx.fill();
-
-    // Eyes
-    ctx.fillStyle = '#fff';
-    ctx.beginPath();
-    ctx.arc(-r * 0.25, -r * 0.1, r * 0.15, 0, Math.PI * 2);
-    ctx.arc(r * 0.25, -r * 0.1, r * 0.15, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.fillStyle = '#222';
-    ctx.beginPath();
-    ctx.arc(-r * 0.22, -r * 0.08, r * 0.08, 0, Math.PI * 2);
-    ctx.arc(r * 0.27, -r * 0.08, r * 0.08, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Name label
-    ctx.fillStyle = 'rgba(0,0,0,0.6)';
-    const nameW = ctx.measureText(player.name).width + 8;
-    ctx.fillRect(-nameW / 2, -r - 20, nameW, 16);
-    ctx.fillStyle = '#fff';
-    ctx.font = '11px monospace';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(player.name, 0, -r - 12);
-
-    // "ME" indicator
-    if (player.id === myId) {
-      ctx.strokeStyle = '#fff';
-      ctx.lineWidth = 2;
-      ctx.setLineDash([3, 3]);
-      ctx.beginPath();
-      ctx.arc(0, 0, r + 5, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
-
+    ctx.font = '14px serif';
+    ctx.rotate(-angle);
+    ctx.fillText('👂', -20, 5);
     ctx.restore();
   });
 }
@@ -375,7 +609,7 @@ function updateInfoBar() {
   const bar = document.getElementById('info-bar');
   bar.innerHTML = '';
 
-  Object.values(gameState.players).forEach(p => {
+  Object.values(roster).forEach(p => {
     const div = document.createElement('div');
     div.className = 'player-info' + (p.alive ? '' : ' dead');
     div.innerHTML = `
@@ -394,6 +628,28 @@ function updateInfoBar() {
   const roomId = document.getElementById('roomId').value || 'default';
   roomSpan.textContent = `Raum: ${roomId}`;
   bar.appendChild(roomSpan);
+}
+
+function updateShadowMeterUI() {
+  const fill = document.getElementById('shadow-meter-fill');
+  const label = document.getElementById('shadow-meter-label');
+  if (!fill) return;
+
+  fill.style.width = `${Math.round(me.shadowMeter * 100)}%`;
+
+  if (me.shadowForm) {
+    fill.style.background = '#b48cff';
+    label.textContent = '🌑 SCHATTENFORM AKTIV';
+  } else if (me.cooldownMs > 0) {
+    fill.style.background = '#555';
+    label.textContent = `Abklingzeit ${(me.cooldownMs / 1000).toFixed(1)}s`;
+  } else if (me.shadowMeter >= 1) {
+    fill.style.background = '#9b59d0';
+    label.textContent = '🌑 BEREIT — SHIFT/E drücken!';
+  } else {
+    fill.style.background = '#6a4a9a';
+    label.textContent = me.inShadow ? 'Im Schatten... lädt' : 'Im Licht — Schatten suchen zum Laden';
+  }
 }
 
 function showOverlay(html) {
@@ -440,22 +696,23 @@ function handleMessage(msg) {
   switch (msg.type) {
     case 'joined':
       myId = msg.playerId;
-      gameState.players = msg.players;
-      gameState.map = msg.map;
-      gameState.bombs = msg.bombs;
-      gameState.explosions = msg.explosions;
-      gameState.powerups = msg.powerups;
-      gameState.gameStarted = msg.gameStarted;
-      gameState.gameOver = msg.gameOver;
+      map = msg.map;
+      gameStarted = msg.gameStarted;
+      gameOver = msg.gameOver;
+      me.x = msg.spawn.x;
+      me.y = msg.spawn.y;
+      me.alive = true;
+      meSpawned = true;
+      resetSeen();
 
       document.getElementById('lobby').style.display = 'none';
       document.getElementById('game-container').style.display = 'flex';
 
       const roomId = document.getElementById('roomId').value || 'default';
       document.getElementById('room-link').innerHTML =
-        `Raum-ID: <strong style="color:#f39c12">${roomId}</strong> — Teile diese ID mit Freunden!`;
+        `Raum-ID: <strong style="color:#b48cff">${roomId}</strong> — Teile diese ID mit Freunden!`;
 
-      if (!gameState.gameStarted) {
+      if (!gameStarted) {
         showOverlay(`
           <h2>Warte auf Spieler...</h2>
           <p style="color:#aaa">Mindestens 2 Spieler benötigt</p>
@@ -465,90 +722,105 @@ function handleMessage(msg) {
         hideOverlay();
       }
 
-      updateInfoBar();
       if (!animFrame) animFrame = requestAnimationFrame(gameLoop);
       break;
 
-    case 'playerJoined':
-      gameState.players[msg.player.id] = msg.player;
+    case 'shadow': {
+      // The per-player filtered snapshot: only what we're allowed to see
+      roster = msg.roster;
+      bombs = msg.bombs;
+      glows = msg.glows;
+      powerups = msg.powerups;
+      footprints = msg.footprints;
+      lanterns = msg.lanterns;
+      flashes = msg.flashes;
+      noises = msg.noises;
+      gameStarted = msg.gameStarted;
+      gameOver = msg.gameOver;
+
+      me.shadowMeter = msg.you.shadowMeter;
+      me.shadowForm = msg.you.shadowForm;
+      me.cooldownMs = msg.you.cooldownMs;
+      me.lightRadius = msg.you.lightRadius;
+      me.inShadow = msg.you.inShadow;
+      me.speed = msg.you.speed;
+      me.alive = msg.you.alive;
+
+      // Update interpolation targets for visible players (self excluded:
+      // our own position is client-side for responsiveness)
+      const stillVisible = {};
+      Object.values(msg.players).forEach(p => {
+        if (p.id === myId) return;
+        if (others[p.id]) {
+          others[p.id].tx = p.x;
+          others[p.id].ty = p.y;
+          others[p.id].name = p.name;
+        } else {
+          others[p.id] = { x: p.x, y: p.y, tx: p.x, ty: p.y, color: p.color, name: p.name, id: p.id };
+        }
+        stillVisible[p.id] = true;
+      });
+      Object.keys(others).forEach(id => {
+        if (!stillVisible[id]) delete others[id];
+      });
+
       updateInfoBar();
       break;
+    }
 
     case 'playerLeft':
-      delete gameState.players[msg.playerId];
+      delete roster[msg.playerId];
+      delete others[msg.playerId];
       updateInfoBar();
       break;
 
     case 'gameStarted':
-      gameState.gameStarted = true;
+      gameStarted = true;
       hideOverlay();
-      updateInfoBar();
-      break;
-
-    case 'playerMoved':
-      if (gameState.players[msg.playerId]) {
-        gameState.players[msg.playerId].x = msg.x;
-        gameState.players[msg.playerId].y = msg.y;
-      }
       break;
 
     case 'bombPlaced':
-      gameState.bombs.push(msg.bomb);
+      // Own bomb: show immediately without waiting for the next snapshot
+      if (!bombs.find(b => b.id === msg.bomb.id)) bombs.push(msg.bomb);
       break;
 
     case 'explosion':
-      gameState.bombs = gameState.bombs.filter(b =>
+      map = msg.map;
+      bombs = bombs.filter(b =>
         !msg.explosion.cells.some(c => c.x === b.x && c.y === b.y));
-      gameState.explosions.push(msg.explosion);
-      gameState.map = msg.map;
-      gameState.powerups = msg.powerups;
+      explosions.push(msg.explosion);
       setTimeout(() => {
-        gameState.explosions = gameState.explosions.filter(e => e.id !== msg.explosion.id);
+        explosions = explosions.filter(e => e.id !== msg.explosion.id);
       }, 800);
       break;
 
     case 'playerDied':
-      if (gameState.players[msg.playerId]) {
-        gameState.players[msg.playerId].alive = false;
-        if (msg.playerId === myId) {
-          // Show "you died" but keep watching
-          showOverlay(`
-            <h2 style="color:#e74c3c">Du bist gestorben!</h2>
-            <p style="color:#aaa">Zuschauen...</p>
-          `);
-          setTimeout(hideOverlay, 2000);
-        }
+      if (roster[msg.playerId]) roster[msg.playerId].alive = false;
+      delete others[msg.playerId];
+      if (msg.playerId === myId) {
+        me.alive = false;
+        showOverlay(`
+          <h2 style="color:#e74c3c">Du bist gestorben!</h2>
+          <p style="color:#aaa">Zuschauen...</p>
+        `);
+        setTimeout(hideOverlay, 2000);
       }
       updateInfoBar();
       break;
 
-    case 'powerupCollected':
-      gameState.powerups = gameState.powerups.filter(p => p.id !== msg.powerupId);
-      if (gameState.players[msg.playerId]) {
-        gameState.players[msg.playerId].maxBombs = msg.maxBombs;
-        gameState.players[msg.playerId].flameSize = msg.flameSize;
-        gameState.players[msg.playerId].speed = msg.speed;
-      }
-      updateInfoBar();
+    case 'powerupCollected': {
+      const labels = { bomb: '💣 +1 Bombe', flame: '🔥 Größere Flamme', speed: '👟 Schneller', torch: '🔦 Mehr Licht' };
+      showPickupToast(labels[msg.powerupType] || '?');
+      me.speed = msg.speed;
+      me.lightRadius = msg.lightRadius;
       break;
-
-    case 'gameState':
-      gameState.players = msg.players;
-      gameState.map = msg.map;
-      gameState.bombs = msg.bombs;
-      gameState.explosions = msg.explosions;
-      gameState.powerups = msg.powerups;
-      gameState.gameStarted = msg.gameStarted;
-      gameState.gameOver = msg.gameOver;
-      updateInfoBar();
-      if (gameState.gameStarted && !gameState.gameOver) hideOverlay();
-      break;
+    }
 
     case 'gameOver':
-      gameState.gameOver = true;
+      gameOver = true;
       const isWinner = msg.winnerId === myId;
       showOverlay(`
-        <h2 style="color:${isWinner ? '#2ecc71' : '#f39c12'}">${
+        <h2 style="color:${isWinner ? '#2ecc71' : '#b48cff'}">${
           msg.winnerId === null ? 'Unentschieden!' :
           isWinner ? '🏆 Du gewinnst!' : `${msg.winnerName} gewinnt!`
         }</h2>
@@ -556,11 +828,38 @@ function handleMessage(msg) {
       `);
       break;
 
+    case 'restart':
+      map = msg.map;
+      gameStarted = msg.gameStarted;
+      gameOver = false;
+      me.x = msg.spawn.x;
+      me.y = msg.spawn.y;
+      me.alive = true;
+      bombs = [];
+      glows = [];
+      explosions = [];
+      others = {};
+      footprints = [];
+      resetSeen();
+      if (gameStarted) hideOverlay();
+      else showOverlay('<h2>Warte auf Spieler...</h2>');
+      break;
+
     case 'error':
       alert(msg.message);
       document.getElementById('joinBtn').disabled = false;
       break;
   }
+}
+
+let toastTimeout = null;
+function showPickupToast(text) {
+  const toast = document.getElementById('pickup-toast');
+  if (!toast) return;
+  toast.textContent = text;
+  toast.style.opacity = '1';
+  clearTimeout(toastTimeout);
+  toastTimeout = setTimeout(() => { toast.style.opacity = '0'; }, 1500);
 }
 
 function restartGame() {
@@ -590,10 +889,8 @@ function addMobileControls() {
       padding: 0;
       border-radius: 8px;
     }
-    #bomb-btn {
-      margin-top: 8px;
-      width: 120px;
-    }
+    #action-btns { display: flex; gap: 8px; margin-top: 8px; }
+    #action-btns button { width: 110px; }
   `;
   document.head.appendChild(style);
 
@@ -611,13 +908,22 @@ function addMobileControls() {
     <div></div>
   `;
 
+  const btns = document.createElement('div');
+  btns.id = 'action-btns';
+
   const bombBtn = document.createElement('button');
-  bombBtn.id = 'bomb-btn';
   bombBtn.textContent = '💣 Bombe';
   bombBtn.addEventListener('touchstart', (e) => { e.preventDefault(); sendBomb(); });
 
+  const shadowBtn = document.createElement('button');
+  shadowBtn.textContent = '🌑 Schatten';
+  shadowBtn.addEventListener('touchstart', (e) => { e.preventDefault(); sendShadowForm(); });
+
+  btns.appendChild(bombBtn);
+  btns.appendChild(shadowBtn);
+
   document.getElementById('game-container').appendChild(mc);
-  document.getElementById('game-container').appendChild(bombBtn);
+  document.getElementById('game-container').appendChild(btns);
 }
 
 addMobileControls();

@@ -12,10 +12,25 @@ app.use(express.static(path.join(__dirname, 'public')));
 // Game constants
 const GRID_WIDTH = 15;
 const GRID_HEIGHT = 13;
-const CELL_SIZE = 40;
 const MAX_PLAYERS = 4;
 const BOMB_TIMER = 3000;
 const EXPLOSION_DURATION = 800;
+
+// Shadow system constants
+const SNAPSHOT_INTERVAL = 100; // 10 Hz per-player filtered snapshots
+const LIGHT_RADIUS_BASE = 3;
+const LIGHT_RADIUS_MAX = 6;
+const LANTERN_RADIUS = 2.5;
+const FLASH_RADIUS = 5;
+const FLASH_DURATION = 1500;
+const FOOTPRINT_LIFETIME = 2500;
+const FOOTPRINT_MIN_DIST = 0.8;
+const NOISE_RADIUS = 5;
+const NOISE_RECENT_MS = 400;
+const BOMB_GLOW_MS = 1000;
+const SHADOW_CHARGE_MS = 3000;
+const SHADOW_FORM_MS = 4000;
+const SHADOW_COOLDOWN_MS = 10000;
 
 // Tile types
 const TILE_EMPTY = 0;
@@ -26,6 +41,16 @@ const TILE_BLOCK = 2; // destructible
 const POWERUP_BOMB = 'bomb';
 const POWERUP_FLAME = 'flame';
 const POWERUP_SPEED = 'speed';
+const POWERUP_TORCH = 'torch';
+
+// Fixed lantern positions (tiles get cleared during map generation)
+const LANTERN_SPOTS = [
+  { x: 7, y: 6 },
+  { x: 3, y: 6 },
+  { x: 11, y: 6 },
+  { x: 7, y: 2 },
+  { x: 7, y: 10 },
+];
 
 // Player start positions
 const START_POSITIONS = [
@@ -39,6 +64,10 @@ const START_COLORS = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12'];
 
 // Game rooms
 const rooms = new Map();
+
+function dist(x1, y1, x2, y2) {
+  return Math.hypot(x1 - x2, y1 - y2);
+}
 
 function generateMap() {
   const map = [];
@@ -70,7 +99,15 @@ function generateMap() {
       }
     }
   }
+  // Keep lantern tiles walkable
+  LANTERN_SPOTS.forEach(({ x, y }) => {
+    if (map[y][x] !== TILE_WALL) map[y][x] = TILE_EMPTY;
+  });
   return map;
+}
+
+function createLanterns() {
+  return LANTERN_SPOTS.map((spot, i) => ({ id: i, x: spot.x, y: spot.y, alive: true }));
 }
 
 function createRoom(roomId) {
@@ -80,6 +117,9 @@ function createRoom(roomId) {
     bombs: [],
     explosions: [],
     powerups: [],
+    footprints: [],
+    flashes: [],
+    lanterns: createLanterns(),
     map: generateMap(),
     gameStarted: false,
     gameOver: false,
@@ -113,42 +153,169 @@ function sendTo(ws, message) {
   }
 }
 
-function getGameState(room) {
-  const players = {};
+// ---- Shadow / visibility system ----
+
+function isShadowForm(player, now) {
+  return player.shadowFormUntil > now;
+}
+
+// Is the tile/position (x, y) lit from the viewer's perspective?
+function isLitFor(room, viewer, x, y, now) {
+  if (dist(viewer.x, viewer.y, x, y) <= viewer.lightRadius) return true;
+  for (const lantern of room.lanterns) {
+    if (lantern.alive && dist(lantern.x, lantern.y, x, y) <= LANTERN_RADIUS) return true;
+  }
+  for (const flash of room.flashes) {
+    if (flash.until > now && dist(flash.x, flash.y, x, y) <= flash.r) return true;
+  }
+  return false;
+}
+
+// "In shadow" for the shadow meter: not lit by lanterns, flashes or OTHER players' lights.
+// The player's own light never counts, otherwise nobody could ever charge the meter.
+function computeInShadow(room, player, now) {
+  for (const lantern of room.lanterns) {
+    if (lantern.alive && dist(lantern.x, lantern.y, player.x, player.y) <= LANTERN_RADIUS) return false;
+  }
+  for (const flash of room.flashes) {
+    if (flash.until > now && dist(flash.x, flash.y, player.x, player.y) <= flash.r) return false;
+  }
+  for (const [, other] of room.players) {
+    if (other.id === player.id || !other.alive) continue;
+    if (dist(other.x, other.y, player.x, player.y) <= other.lightRadius) return false;
+  }
+  return true;
+}
+
+function directionBucket(dx, dy) {
+  const angle = Math.atan2(dy, dx);
+  const buckets = ['E', 'SE', 'S', 'SW', 'W', 'NW', 'N', 'NE'];
+  const idx = Math.round(angle / (Math.PI / 4));
+  return buckets[(idx + 8) % 8];
+}
+
+function buildSnapshot(room, viewer, now) {
+  // Roster: names & stats of everyone (no positions) for the info bar
+  const roster = {};
   room.players.forEach((p, id) => {
-    players[id] = {
-      id: p.id,
-      x: p.x,
-      y: p.y,
-      alive: p.alive,
-      color: p.color,
+    roster[id] = {
+      id,
       name: p.name,
-      bombCount: p.bombCount,
+      color: p.color,
+      alive: p.alive,
       maxBombs: p.maxBombs,
       flameSize: p.flameSize,
     };
   });
+
+  // Players: only those the viewer is allowed to see
+  const players = {};
+  room.players.forEach((p, id) => {
+    if (!p.alive) return;
+    if (id !== viewer.id && isShadowForm(p, now)) return; // shadow form: invisible even in light
+    if (id === viewer.id || isLitFor(room, viewer, p.x, p.y, now)) {
+      players[id] = { id, x: p.x, y: p.y, color: p.color, name: p.name };
+    }
+  });
+
+  // Bombs: fully visible when lit; unlit bombs only appear as a faint glow
+  // during their last second
+  const bombs = [];
+  const glows = [];
+  for (const b of room.bombs) {
+    if (isLitFor(room, viewer, b.x, b.y, now)) {
+      bombs.push({ id: b.id, x: b.x, y: b.y });
+    } else {
+      const remaining = b.explodeAt - now;
+      if (remaining <= BOMB_GLOW_MS) {
+        glows.push({ id: b.id, x: b.x, y: b.y, remaining });
+      }
+    }
+  }
+
+  const powerups = room.powerups.filter(pu => isLitFor(room, viewer, pu.x, pu.y, now));
+
+  const footprints = room.footprints
+    .filter(fp => fp.playerId !== viewer.id && isLitFor(room, viewer, fp.x, fp.y, now))
+    .map(fp => ({ x: fp.x, y: fp.y, age: now - fp.t }));
+
+  // Noise hints: direction of nearby invisible enemies that recently moved
+  // or placed a bomb — never exact coordinates
+  const noises = new Set();
+  room.players.forEach((p, id) => {
+    if (id === viewer.id || !p.alive || players[id]) return;
+    if (now - (p.lastActionAt || 0) > NOISE_RECENT_MS) return;
+    if (dist(viewer.x, viewer.y, p.x, p.y) > NOISE_RADIUS) return;
+    noises.add(directionBucket(p.x - viewer.x, p.y - viewer.y));
+  });
+
   return {
-    type: 'gameState',
+    type: 'shadow',
+    you: {
+      shadowMeter: viewer.shadowMeter,
+      shadowForm: isShadowForm(viewer, now),
+      cooldownMs: Math.max(0, viewer.shadowCooldownUntil - now),
+      lightRadius: viewer.lightRadius,
+      inShadow: viewer.inShadow,
+      speed: viewer.speed,
+      alive: viewer.alive,
+    },
+    roster,
     players,
-    bombs: room.bombs,
-    explosions: room.explosions,
-    powerups: room.powerups,
-    map: room.map,
+    bombs,
+    glows,
+    powerups,
+    footprints,
+    lanterns: room.lanterns,
+    flashes: room.flashes.map(f => ({ x: f.x, y: f.y, r: f.r, remaining: f.until - now })),
+    noises: [...noises],
     gameStarted: room.gameStarted,
     gameOver: room.gameOver,
   };
 }
 
-function checkCollision(room, x, y) {
+function tickRoom(room, now) {
+  room.flashes = room.flashes.filter(f => f.until > now);
+  room.footprints = room.footprints.filter(fp => now - fp.t < FOOTPRINT_LIFETIME);
+
+  room.players.forEach(p => {
+    if (!p.alive) return;
+    p.inShadow = computeInShadow(room, p, now);
+    if (
+      room.gameStarted && !room.gameOver &&
+      p.inShadow && !isShadowForm(p, now) && now >= p.shadowCooldownUntil
+    ) {
+      p.shadowMeter = Math.min(1, p.shadowMeter + SNAPSHOT_INTERVAL / SHADOW_CHARGE_MS);
+    }
+  });
+
+  room.players.forEach(p => {
+    sendTo(p.ws, buildSnapshot(room, p, now));
+  });
+}
+
+setInterval(() => {
+  const now = Date.now();
+  rooms.forEach(room => {
+    if (room.players.size > 0) tickRoom(room, now);
+  });
+}, SNAPSHOT_INTERVAL);
+
+// ---- Core game logic ----
+
+function checkCollision(room, x, y, phasing) {
   const tileX = Math.round(x);
   const tileY = Math.round(y);
   if (tileX < 0 || tileX >= GRID_WIDTH || tileY < 0 || tileY >= GRID_HEIGHT) return true;
-  return room.map[tileY][tileX] !== TILE_EMPTY;
+  const tile = room.map[tileY][tileX];
+  if (tile === TILE_WALL) return true;
+  if (tile === TILE_BLOCK) return !phasing; // shadow form slips through blocks
+  return false;
 }
 
 function placeBomb(room, player) {
   if (player.bombCount >= player.maxBombs) return;
+  if (isShadowForm(player, Date.now())) return; // no bombs while in shadow form
 
   const bx = Math.round(player.x);
   const by = Math.round(player.y);
@@ -157,6 +324,7 @@ function placeBomb(room, player) {
   if (room.bombs.find(b => b.x === bx && b.y === by)) return;
 
   player.bombCount++;
+  player.lastActionAt = Date.now();
 
   const bomb = {
     id: Date.now() + Math.random(),
@@ -164,11 +332,12 @@ function placeBomb(room, player) {
     y: by,
     playerId: player.id,
     flameSize: player.flameSize,
-    timer: BOMB_TIMER,
+    explodeAt: Date.now() + BOMB_TIMER,
   };
 
   room.bombs.push(bomb);
-  broadcastAll(room, { type: 'bombPlaced', bomb });
+  // Only the owner learns about it immediately — everyone else has to see it
+  sendTo(player.ws, { type: 'bombPlaced', bomb: { id: bomb.id, x: bomb.x, y: bomb.y } });
 
   setTimeout(() => explodeBomb(room, bomb), BOMB_TIMER);
 }
@@ -178,6 +347,7 @@ function explodeBomb(room, bomb) {
   if (idx === -1) return;
   room.bombs.splice(idx, 1);
 
+  const now = Date.now();
   const player = room.players.get(bomb.playerId);
   if (player) player.bombCount = Math.max(0, player.bombCount - 1);
 
@@ -195,8 +365,8 @@ function explodeBomb(room, bomb) {
         // Destroy block
         room.map[ny][nx] = TILE_EMPTY;
         // Maybe spawn powerup
-        if (Math.random() < 0.3) {
-          const types = [POWERUP_BOMB, POWERUP_FLAME, POWERUP_SPEED];
+        if (Math.random() < 0.35) {
+          const types = [POWERUP_BOMB, POWERUP_FLAME, POWERUP_SPEED, POWERUP_TORCH];
           const pu = {
             id: Date.now() + Math.random(),
             x: nx,
@@ -217,7 +387,17 @@ function explodeBomb(room, bomb) {
     }
   }
 
-  // Check player hits
+  // Destroy lanterns caught in the blast
+  room.lanterns.forEach(l => {
+    if (l.alive && cells.some(c => c.x === l.x && c.y === l.y)) {
+      l.alive = false;
+    }
+  });
+
+  // The blast lights up the surroundings for a moment
+  room.flashes.push({ x: bomb.x, y: bomb.y, r: FLASH_RADIUS, until: now + FLASH_DURATION });
+
+  // Check player hits (shadow form does NOT protect)
   room.players.forEach((p) => {
     if (!p.alive) return;
     const hit = cells.find(c => Math.abs(c.x - Math.round(p.x)) < 0.6 && Math.abs(c.y - Math.round(p.y)) < 0.6);
@@ -230,7 +410,7 @@ function explodeBomb(room, bomb) {
 
   const explosion = { id: Date.now() + Math.random(), cells };
   room.explosions.push(explosion);
-  broadcastAll(room, { type: 'explosion', explosion, map: room.map, powerups: room.powerups });
+  broadcastAll(room, { type: 'explosion', explosion, map: room.map });
 
   setTimeout(() => {
     const ei = room.explosions.indexOf(explosion);
@@ -261,15 +441,34 @@ function collectPowerups(room, player) {
   if (pu.type === POWERUP_BOMB) player.maxBombs = Math.min(player.maxBombs + 1, 8);
   if (pu.type === POWERUP_FLAME) player.flameSize = Math.min(player.flameSize + 1, 8);
   if (pu.type === POWERUP_SPEED) player.speed = Math.min(player.speed + 0.02, 0.15);
+  if (pu.type === POWERUP_TORCH) player.lightRadius = Math.min(player.lightRadius + 1, LIGHT_RADIUS_MAX);
 
-  broadcastAll(room, {
+  sendTo(player.ws, {
     type: 'powerupCollected',
-    powerupId: pu.id,
-    playerId: player.id,
+    powerupType: pu.type,
     maxBombs: player.maxBombs,
     flameSize: player.flameSize,
     speed: player.speed,
+    lightRadius: player.lightRadius,
   });
+}
+
+function resetPlayer(player, index) {
+  const pos = START_POSITIONS[index % START_POSITIONS.length];
+  player.x = pos.x;
+  player.y = pos.y;
+  player.alive = true;
+  player.bombCount = 0;
+  player.maxBombs = 1;
+  player.flameSize = 2;
+  player.speed = 0.08;
+  player.lightRadius = LIGHT_RADIUS_BASE;
+  player.shadowMeter = 0;
+  player.shadowFormUntil = 0;
+  player.shadowCooldownUntil = 0;
+  player.inShadow = false;
+  player.lastFootprint = null;
+  player.lastActionAt = 0;
 }
 
 wss.on('connection', (ws) => {
@@ -301,16 +500,12 @@ wss.on('connection', (ws) => {
         const player = {
           id: currentPlayerId,
           ws,
+          name: (msg.name || `Spieler ${currentPlayerId + 1}`).slice(0, 16),
+          color: START_COLORS[currentPlayerId % START_COLORS.length],
           x: startPos.x,
           y: startPos.y,
-          alive: true,
-          color: START_COLORS[currentPlayerId % START_COLORS.length],
-          name: msg.name || `Spieler ${currentPlayerId + 1}`,
-          bombCount: 0,
-          maxBombs: 1,
-          flameSize: 2,
-          speed: 0.08,
         };
+        resetPlayer(player, currentPlayerId);
 
         room.players.set(currentPlayerId, player);
 
@@ -318,20 +513,11 @@ wss.on('connection', (ws) => {
           type: 'joined',
           playerId: currentPlayerId,
           roomId,
-          ...getGameState(room),
+          map: room.map,
+          spawn: { x: player.x, y: player.y },
+          gameStarted: room.gameStarted,
+          gameOver: room.gameOver,
         });
-
-        broadcast(room, {
-          type: 'playerJoined',
-          player: {
-            id: player.id,
-            x: player.x,
-            y: player.y,
-            alive: player.alive,
-            color: player.color,
-            name: player.name,
-          },
-        }, currentPlayerId);
 
         // Auto-start when 2+ players
         if (room.players.size >= 2 && !room.gameStarted) {
@@ -346,15 +532,28 @@ wss.on('connection', (ws) => {
         const player = currentRoom.players.get(currentPlayerId);
         if (!player || !player.alive || !currentRoom.gameStarted) return;
 
+        const now = Date.now();
         let { x, y } = msg;
+        if (typeof x !== 'number' || typeof y !== 'number') return;
         x = Math.max(0.5, Math.min(GRID_WIDTH - 1.5, x));
         y = Math.max(0.5, Math.min(GRID_HEIGHT - 1.5, y));
 
-        if (!checkCollision(currentRoom, x, y)) {
+        const phasing = isShadowForm(player, now);
+        if (!checkCollision(currentRoom, x, y, phasing)) {
           player.x = x;
           player.y = y;
+          player.lastActionAt = now;
+
+          // Footprints — but not while gliding in shadow form
+          if (!phasing) {
+            const lf = player.lastFootprint;
+            if (!lf || dist(lf.x, lf.y, x, y) >= FOOTPRINT_MIN_DIST) {
+              currentRoom.footprints.push({ x, y, t: now, playerId: player.id });
+              player.lastFootprint = { x, y };
+            }
+          }
+
           collectPowerups(currentRoom, player);
-          broadcast(currentRoom, { type: 'playerMoved', playerId: currentPlayerId, x, y }, currentPlayerId);
         }
         break;
       }
@@ -367,31 +566,42 @@ wss.on('connection', (ws) => {
         break;
       }
 
+      case 'shadowForm': {
+        if (!currentRoom || currentPlayerId === null) return;
+        const player = currentRoom.players.get(currentPlayerId);
+        if (!player || !player.alive || !currentRoom.gameStarted) return;
+
+        const now = Date.now();
+        if (player.shadowMeter >= 1 && now >= player.shadowCooldownUntil && !isShadowForm(player, now)) {
+          player.shadowMeter = 0;
+          player.shadowFormUntil = now + SHADOW_FORM_MS;
+          player.shadowCooldownUntil = player.shadowFormUntil + SHADOW_COOLDOWN_MS;
+        }
+        break;
+      }
+
       case 'restart': {
         if (!currentRoom) return;
-        // Reset game
         currentRoom.map = generateMap();
         currentRoom.bombs = [];
         currentRoom.explosions = [];
         currentRoom.powerups = [];
+        currentRoom.footprints = [];
+        currentRoom.flashes = [];
+        currentRoom.lanterns = createLanterns();
         currentRoom.gameOver = false;
         currentRoom.gameStarted = currentRoom.players.size >= 2;
 
-        currentRoom.players.forEach((p, i) => {
-          const pos = START_POSITIONS[i % START_POSITIONS.length];
-          p.x = pos.x;
-          p.y = pos.y;
-          p.alive = true;
-          p.bombCount = 0;
-          p.maxBombs = 1;
-          p.flameSize = 2;
-          p.speed = 0.08;
+        let i = 0;
+        currentRoom.players.forEach((p) => {
+          resetPlayer(p, i++);
+          sendTo(p.ws, {
+            type: 'restart',
+            map: currentRoom.map,
+            spawn: { x: p.x, y: p.y },
+            gameStarted: currentRoom.gameStarted,
+          });
         });
-
-        broadcastAll(currentRoom, getGameState(currentRoom));
-        if (currentRoom.gameStarted) {
-          broadcastAll(currentRoom, { type: 'gameStarted' });
-        }
         break;
       }
     }
@@ -412,6 +622,6 @@ wss.on('connection', (ws) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Bomberman Multiplayer Server läuft auf Port ${PORT}`);
+  console.log(`Shadow Bomber Server läuft auf Port ${PORT}`);
   console.log(`Öffne http://localhost:${PORT} im Browser`);
 });
