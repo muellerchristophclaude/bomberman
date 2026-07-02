@@ -49,6 +49,128 @@ let explosions = [];
 
 let animFrame = null;
 let keys = {};
+let roundNum = 1;
+let suddenDeathOn = false;
+let suddenDeathMs = null;
+let moveLockedUntil = 0;
+
+// ---- Sound (Web Audio, fully synthesized — no asset files) ----
+let audioCtx = null;
+let muted = localStorage.getItem('sb-muted') === '1';
+
+function initAudio() {
+  if (!audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (AC) audioCtx = new AC();
+  }
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function tone(freq, dur, type = 'square', vol = 0.15, delay = 0, endFreq = null) {
+  if (!audioCtx || muted) return;
+  const t0 = audioCtx.currentTime + delay;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(freq, t0);
+  if (endFreq) o.frequency.exponentialRampToValueAtTime(Math.max(30, endFreq), t0 + dur);
+  g.gain.setValueAtTime(vol, t0);
+  g.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+  o.connect(g).connect(audioCtx.destination);
+  o.start(t0);
+  o.stop(t0 + dur + 0.05);
+}
+
+function noiseBurst(dur, vol = 0.3, delay = 0, cutoff = 1000) {
+  if (!audioCtx || muted) return;
+  const t0 = audioCtx.currentTime + delay;
+  const len = Math.ceil(audioCtx.sampleRate * dur);
+  const buf = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  const filter = audioCtx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.value = cutoff;
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(vol, t0);
+  g.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+  src.connect(filter).connect(g).connect(audioCtx.destination);
+  src.start(t0);
+}
+
+const sfx = {
+  explosion() { noiseBurst(0.45, 0.35, 0, 900); tone(100, 0.5, 'sine', 0.4, 0, 40); },
+  place() { tone(220, 0.08, 'square', 0.12, 0, 120); },
+  pickup() { tone(660, 0.08, 'square', 0.12); tone(990, 0.12, 'square', 0.12, 0.08); },
+  death() { tone(400, 0.5, 'sawtooth', 0.18, 0, 60); },
+  shadow() { noiseBurst(0.4, 0.18, 0, 400); tone(300, 0.4, 'sine', 0.15, 0, 90); },
+  ready() { tone(523, 0.1, 'sine', 0.14); tone(784, 0.18, 'sine', 0.14, 0.1); },
+  count() { tone(440, 0.12, 'square', 0.15); },
+  go() { tone(880, 0.25, 'square', 0.16); },
+  win() { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.18, 'square', 0.13, i * 0.13)); },
+  lose() { [392, 330, 262].forEach((f, i) => tone(f, 0.22, 'sawtooth', 0.12, i * 0.18)); },
+  warning() { tone(220, 0.25, 'sawtooth', 0.2); tone(220, 0.25, 'sawtooth', 0.2, 0.35); tone(165, 0.45, 'sawtooth', 0.2, 0.7); },
+  thud() { tone(80, 0.12, 'sine', 0.14, 0, 40); noiseBurst(0.08, 0.06, 0, 300); },
+};
+
+function toggleMute() {
+  muted = !muted;
+  localStorage.setItem('sb-muted', muted ? '1' : '0');
+  const btn = document.getElementById('mute-btn');
+  if (btn) btn.textContent = muted ? '🔇' : '🔊';
+}
+
+// ---- Screenshake ----
+const SHAKE_MS = 250;
+let shakePower = 0;
+let shakeUntil = 0;
+
+function addShake(power) {
+  shakePower = Math.max(shakePower, power);
+  shakeUntil = performance.now() + SHAKE_MS;
+}
+
+// ---- Particles ----
+let particles = [];
+
+function spawnParticles(tileX, tileY, color, count, speed) {
+  for (let i = 0; i < count; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const v = (0.3 + Math.random() * 0.7) * speed * CELL_SIZE;
+    particles.push({
+      x: tileX * CELL_SIZE + CELL_SIZE / 2,
+      y: tileY * CELL_SIZE + CELL_SIZE / 2,
+      vx: Math.cos(a) * v,
+      vy: Math.sin(a) * v,
+      life: 0.4 + Math.random() * 0.4,
+      size: 2 + Math.random() * 3,
+      color,
+    });
+  }
+}
+
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vx *= 1 - 4 * dt;
+    p.vy *= 1 - 4 * dt;
+    p.life -= dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+function drawParticles() {
+  particles.forEach(p => {
+    ctx.globalAlpha = Math.max(0, Math.min(1, p.life / 0.5));
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  });
+  ctx.globalAlpha = 1;
+}
 
 // Input
 const moveKeys = {
@@ -86,6 +208,7 @@ function gameLoop(ts) {
 
   if (myId !== null && dt > 0) handleMovement(dt, ts);
   interpolateOthers(dt);
+  updateParticles(dt);
   updateSeenTiles();
   render();
   updateShadowMeterUI();
@@ -115,6 +238,7 @@ const clampY = (y) => Math.max(1, Math.min(GRID_HEIGHT - 2, y));
 
 function handleMovement(dt, ts) {
   if (!me.alive || !gameStarted || !meSpawned) return;
+  if (performance.now() < moveLockedUntil) return; // round countdown
 
   let dx = 0, dy = 0;
   for (const [key, [kx, ky]] of Object.entries(moveKeys)) {
@@ -260,6 +384,20 @@ function render() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   if (!map.length) return;
 
+  // Screenshake offset
+  let sx = 0, sy = 0;
+  const nowp = performance.now();
+  if (nowp < shakeUntil) {
+    const k = shakePower * ((shakeUntil - nowp) / SHAKE_MS);
+    sx = (Math.random() * 2 - 1) * k;
+    sy = (Math.random() * 2 - 1) * k;
+  } else {
+    shakePower = 0;
+  }
+
+  ctx.save();
+  ctx.translate(sx, sy);
+
   drawMap();
   drawFootprints();
   drawPowerups();
@@ -267,10 +405,13 @@ function render() {
   drawBombs();
   drawGlows();
   drawExplosions();
+  drawParticles();
   drawPlayers();
   drawDarkness();
   drawUnseen();
   drawNoiseIndicators();
+
+  ctx.restore();
 }
 
 function drawMap() {
@@ -667,19 +808,55 @@ function updateInfoBar() {
     div.innerHTML = `
       <div class="player-dot" style="background:${p.color}"></div>
       <span>${p.name}</span>
+      <span title="Runden gewonnen">🏆${p.wins || 0}</span>
       <span title="Bomben">💣${p.maxBombs}</span>
       <span title="Flamme">🔥${p.flameSize}</span>
     `;
     bar.appendChild(div);
   });
 
-  const roomSpan = document.createElement('span');
-  roomSpan.style.marginLeft = 'auto';
-  roomSpan.style.fontSize = '0.75rem';
-  roomSpan.style.color = '#888';
+  const right = document.createElement('span');
+  right.style.marginLeft = 'auto';
+  right.style.fontSize = '0.75rem';
+  right.style.color = '#888';
   const roomId = document.getElementById('roomId').value || 'default';
-  roomSpan.textContent = `Raum: ${roomId}`;
-  bar.appendChild(roomSpan);
+  let text = `Runde ${roundNum} · Raum: ${roomId}`;
+  if (gameStarted && !gameOver && suddenDeathMs != null) {
+    if (suddenDeathOn) {
+      text = `☠️ SUDDEN DEATH · ${text}`;
+      right.style.color = '#ff5555';
+    } else if (suddenDeathMs < 30000) {
+      const s = Math.ceil(suddenDeathMs / 1000);
+      text = `☠️ in ${s}s · ${text}`;
+      right.style.color = '#e0a030';
+    }
+  }
+  right.textContent = text;
+  bar.appendChild(right);
+}
+
+// Round countdown overlay (3-2-1-LOS)
+let countdownTimers = [];
+function runCountdown(ms, round, scores) {
+  countdownTimers.forEach(clearTimeout);
+  countdownTimers = [];
+  const scoreLine = scores.map(s => `${s.name}: ${s.wins}`).join(' · ');
+  const stepMs = (ms - 100) / 3;
+  [3, 2, 1].forEach((n, i) => {
+    countdownTimers.push(setTimeout(() => {
+      showOverlay(`
+        <p style="color:#aaa">Runde ${round}</p>
+        <h2 style="font-size:3.5rem">${n}</h2>
+        <p style="color:#888; font-size:0.85rem">${scoreLine}</p>
+      `);
+      sfx.count();
+    }, i * stepMs));
+  });
+  countdownTimers.push(setTimeout(() => {
+    showOverlay('<h2 style="font-size:3.5rem; color:#2ecc71">LOS!</h2>');
+    sfx.go();
+  }, ms - 100));
+  countdownTimers.push(setTimeout(hideOverlay, ms + 500));
 }
 
 function updateShadowMeterUI() {
@@ -720,6 +897,7 @@ function joinGame() {
   const roomId = document.getElementById('roomId').value.trim() || 'default';
 
   document.getElementById('joinBtn').disabled = true;
+  initAudio(); // AudioContext needs a user gesture — the join click is one
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = `${proto}//${location.host}`;
@@ -784,6 +962,8 @@ function handleMessage(msg) {
 
     case 'shadow': {
       // The per-player filtered snapshot: only what we're allowed to see
+      const wasForm = me.shadowForm;
+      const wasMeter = me.shadowMeter;
       roster = msg.roster;
       bombs = msg.bombs;
       glows = msg.glows;
@@ -794,6 +974,9 @@ function handleMessage(msg) {
       noises = msg.noises;
       gameStarted = msg.gameStarted;
       gameOver = msg.gameOver;
+      roundNum = msg.round;
+      suddenDeathOn = msg.suddenDeathOn;
+      suddenDeathMs = msg.suddenDeathMs;
 
       me.shadowMeter = msg.you.shadowMeter;
       me.shadowForm = msg.you.shadowForm;
@@ -802,6 +985,9 @@ function handleMessage(msg) {
       me.inShadow = msg.you.inShadow;
       me.speed = msg.you.speed;
       me.alive = msg.you.alive;
+
+      if (!wasForm && me.shadowForm) sfx.shadow();
+      if (wasMeter < 1 && me.shadowMeter >= 1 && me.cooldownMs <= 0) sfx.ready();
 
       // Update interpolation targets for visible players (self excluded:
       // our own position is client-side for responsiveness)
@@ -836,17 +1022,20 @@ function handleMessage(msg) {
       updateInfoBar();
       break;
 
-    case 'gameStarted':
-      gameStarted = true;
-      hideOverlay();
-      break;
-
     case 'bombPlaced':
       // Own bomb: show immediately without waiting for the next snapshot
       if (!bombs.find(b => b.id === msg.bomb.id)) bombs.push(msg.bomb);
+      sfx.place();
       break;
 
-    case 'explosion':
+    case 'explosion': {
+      // Debris for destroyed blocks (diff old vs. new map), sparks everywhere
+      msg.explosion.cells.forEach(c => {
+        if (map[c.y] && map[c.y][c.x] === TILE_BLOCK && msg.map[c.y][c.x] === TILE_EMPTY) {
+          spawnParticles(c.x, c.y, COLORS.blockHighlight, 8, 3);
+        }
+        spawnParticles(c.x, c.y, '#ff8030', 3, 4);
+      });
       map = msg.map;
       bombs = bombs.filter(b =>
         !msg.explosion.cells.some(c => c.x === b.x && c.y === b.y));
@@ -854,18 +1043,27 @@ function handleMessage(msg) {
       setTimeout(() => {
         explosions = explosions.filter(e => e.id !== msg.explosion.id);
       }, 800);
+
+      const dmin = Math.min(...msg.explosion.cells.map(c => Math.hypot(c.x - me.x, c.y - me.y)));
+      addShake(Math.max(2, 9 - dmin));
+      sfx.explosion();
       break;
+    }
 
     case 'playerDied':
       if (roster[msg.playerId]) roster[msg.playerId].alive = false;
       delete others[msg.playerId];
+      sfx.death();
       if (msg.playerId === myId) {
         me.alive = false;
+        addShake(8);
         showOverlay(`
           <h2 style="color:#e74c3c">Du bist gestorben!</h2>
           <p style="color:#aaa">Zuschauen...</p>
         `);
         setTimeout(hideOverlay, 2000);
+      } else if (roster[msg.playerId]) {
+        showPickupToast(`💀 ${roster[msg.playerId].name} wurde erwischt!`);
       }
       updateInfoBar();
       break;
@@ -875,36 +1073,83 @@ function handleMessage(msg) {
       showPickupToast(labels[msg.powerupType] || '?');
       me.speed = msg.speed;
       me.lightRadius = msg.lightRadius;
+      sfx.pickup();
+      spawnParticles(Math.round(me.x), Math.round(me.y), '#b48cff', 8, 2.5);
       break;
     }
 
-    case 'gameOver':
-      gameOver = true;
-      const isWinner = msg.winnerId === myId;
-      showOverlay(`
-        <h2 style="color:${isWinner ? '#2ecc71' : '#b48cff'}">${
-          msg.winnerId === null ? 'Unentschieden!' :
-          isWinner ? '🏆 Du gewinnst!' : `${msg.winnerName} gewinnt!`
-        }</h2>
-        <button onclick="restartGame()">Nochmal spielen</button>
-      `);
-      break;
-
-    case 'restart':
+    case 'roundStart':
       map = msg.map;
-      gameStarted = msg.gameStarted;
+      roundNum = msg.round;
+      gameStarted = true;
       gameOver = false;
+      suddenDeathOn = false;
       me.x = msg.spawn.x;
       me.y = msg.spawn.y;
       me.alive = true;
+      meSpawned = true;
       bombs = [];
       glows = [];
       explosions = [];
       others = {};
       footprints = [];
+      particles = [];
       resetSeen();
-      if (gameStarted) hideOverlay();
-      else showOverlay('<h2>Warte auf Spieler...</h2><button onclick="sendAddBot()">🤖 Bot hinzufügen</button>');
+      moveLockedUntil = performance.now() + msg.countdownMs;
+      runCountdown(msg.countdownMs, msg.round, msg.scores);
+      break;
+
+    case 'roundOver': {
+      gameOver = true;
+      const line = msg.scores.map(s => `${s.name}: ${s.wins}`).join(' · ');
+      const mine = msg.winnerId === myId;
+      showOverlay(`
+        <h2 style="color:${mine ? '#2ecc71' : '#b48cff'}">${
+          msg.winnerId === null ? 'Unentschieden!' :
+          mine ? '🏆 Runde gewonnen!' : `${msg.winnerName} gewinnt die Runde!`
+        }</h2>
+        <p>${line}</p>
+        <p style="color:#888">Nächste Runde startet gleich...</p>
+      `);
+      sfx[mine ? 'win' : 'lose']();
+      break;
+    }
+
+    case 'matchOver': {
+      gameOver = true;
+      const line = msg.scores.map(s => `${s.name}: ${s.wins}`).join(' · ');
+      const mine = msg.winnerId === myId;
+      showOverlay(`
+        <h2 style="color:${mine ? '#2ecc71' : '#b48cff'}">${
+          mine ? '🏆 Du gewinnst das Match!' : `${msg.winnerName} gewinnt das Match!`
+        }</h2>
+        <p>${line}</p>
+        <button onclick="restartGame()">Nochmal spielen</button>
+      `);
+      sfx[mine ? 'win' : 'lose']();
+      break;
+    }
+
+    case 'suddenDeath':
+      suddenDeathOn = true;
+      showPickupToast('☠️ SUDDEN DEATH — Die Arena stürzt ein!', 3000);
+      sfx.warning();
+      addShake(5);
+      break;
+
+    case 'shrink':
+      if (map[msg.y]) map[msg.y][msg.x] = TILE_WALL;
+      bombs = bombs.filter(b => !(b.x === msg.x && b.y === msg.y));
+      glows = glows.filter(g => !(g.x === msg.x && g.y === msg.y));
+      spawnParticles(msg.x, msg.y, '#667', 6, 3);
+      sfx.thud();
+      addShake(2);
+      break;
+
+    case 'waiting':
+      gameStarted = false;
+      gameOver = false;
+      showOverlay('<h2>Warte auf Spieler...</h2><button onclick="sendAddBot()">🤖 Bot hinzufügen</button>');
       break;
 
     case 'error':
@@ -915,13 +1160,13 @@ function handleMessage(msg) {
 }
 
 let toastTimeout = null;
-function showPickupToast(text) {
+function showPickupToast(text, duration = 1500) {
   const toast = document.getElementById('pickup-toast');
   if (!toast) return;
   toast.textContent = text;
   toast.style.opacity = '1';
   clearTimeout(toastTimeout);
-  toastTimeout = setTimeout(() => { toast.style.opacity = '0'; }, 1500);
+  toastTimeout = setTimeout(() => { toast.style.opacity = '0'; }, duration);
 }
 
 function restartGame() {
@@ -989,3 +1234,9 @@ function addMobileControls() {
 }
 
 addMobileControls();
+
+// Initial mute icon from stored preference
+{
+  const btn = document.getElementById('mute-btn');
+  if (btn) btn.textContent = muted ? '🔇' : '🔊';
+}

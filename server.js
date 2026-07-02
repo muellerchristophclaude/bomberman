@@ -32,6 +32,13 @@ const SHADOW_CHARGE_MS = 3000;
 const SHADOW_FORM_MS = 4000;
 const SHADOW_COOLDOWN_MS = 10000;
 
+// Rounds & sudden death
+const WINS_NEEDED = 2;            // best-of-3
+const COUNTDOWN_MS = 3000;
+const ROUND_BREAK_MS = 4000;
+const SUDDEN_DEATH_MS = parseInt(process.env.SUDDEN_DEATH_MS, 10) || 120000; // 2 min after round start
+const SHRINK_INTERVAL_MS = 400;
+
 // Tile types
 const TILE_EMPTY = 0;
 const TILE_WALL = 1;
@@ -61,6 +68,21 @@ const START_POSITIONS = [
 ];
 
 const START_COLORS = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12'];
+
+// Sudden death: tiles collapse in a clockwise spiral from the outside in
+// (fixed pillars are skipped — they're already solid)
+const SHRINK_ORDER = (() => {
+  const order = [];
+  let left = 1, top = 1, right = GRID_WIDTH - 2, bottom = GRID_HEIGHT - 2;
+  while (left <= right && top <= bottom) {
+    for (let x = left; x <= right; x++) order.push({ x, y: top });
+    for (let y = top + 1; y <= bottom; y++) order.push({ x: right, y });
+    if (bottom > top) for (let x = right - 1; x >= left; x--) order.push({ x, y: bottom });
+    if (right > left) for (let y = bottom - 1; y > top; y--) order.push({ x: left, y });
+    left++; top++; right--; bottom--;
+  }
+  return order.filter(t => !(t.x % 2 === 0 && t.y % 2 === 0));
+})();
 
 // Game rooms
 const rooms = new Map();
@@ -123,6 +145,12 @@ function createRoom(roomId) {
     map: generateMap(),
     gameStarted: false,
     gameOver: false,
+    round: 1,
+    roundStartAt: 0,
+    suddenDeathAt: Infinity,
+    suddenDeathOn: false,
+    nextShrinkAt: 0,
+    shrinkIndex: 0,
     nextPlayerId: 0,
   };
 }
@@ -205,6 +233,7 @@ function buildSnapshot(room, viewer, now) {
       alive: p.alive,
       maxBombs: p.maxBombs,
       flameSize: p.flameSize,
+      wins: p.wins || 0,
     };
   });
 
@@ -271,6 +300,9 @@ function buildSnapshot(room, viewer, now) {
     noises: [...noises],
     gameStarted: room.gameStarted,
     gameOver: room.gameOver,
+    round: room.round,
+    suddenDeathOn: room.suddenDeathOn,
+    suddenDeathMs: room.suddenDeathAt === Infinity ? null : Math.max(0, room.suddenDeathAt - now),
   };
 }
 
@@ -429,6 +461,7 @@ function planBot(room, bot, now) {
 
 function updateBot(room, bot, now) {
   if (!bot.alive || !room.gameStarted || room.gameOver) return;
+  if (now < room.roundStartAt) return; // countdown
 
   const bx = Math.round(bot.x);
   const by = Math.round(bot.y);
@@ -479,6 +512,19 @@ function updateBot(room, bot, now) {
 function tickRoom(room, now) {
   room.flashes = room.flashes.filter(f => f.until > now);
   room.footprints = room.footprints.filter(fp => now - fp.t < FOOTPRINT_LIFETIME);
+
+  // Sudden death: the arena collapses from the outside in
+  if (room.gameStarted && !room.gameOver && now >= room.suddenDeathAt) {
+    if (!room.suddenDeathOn) {
+      room.suddenDeathOn = true;
+      room.nextShrinkAt = now;
+      broadcastAll(room, { type: 'suddenDeath' });
+    }
+    while (!room.gameOver && now >= room.nextShrinkAt && room.shrinkIndex < SHRINK_ORDER.length) {
+      room.nextShrinkAt += SHRINK_INTERVAL_MS;
+      shrinkStep(room);
+    }
+  }
 
   room.players.forEach(p => {
     if (p.isBot) updateBot(room, p, now);
@@ -614,7 +660,7 @@ function explodeBomb(room, bomb) {
     if (hit) {
       p.alive = false;
       broadcastAll(room, { type: 'playerDied', playerId: p.id });
-      checkGameOver(room);
+      checkRoundOver(room);
     }
   });
 
@@ -628,17 +674,106 @@ function explodeBomb(room, bomb) {
   }, EXPLOSION_DURATION);
 }
 
-function checkGameOver(room) {
+function scoreList(room) {
+  return [...room.players.values()].map(p => ({ name: p.name, wins: p.wins || 0 }));
+}
+
+function startRound(room) {
+  const now = Date.now();
+  room.map = generateMap();
+  room.bombs = [];
+  room.explosions = [];
+  room.powerups = [];
+  room.footprints = [];
+  room.flashes = [];
+  room.lanterns = createLanterns();
+  room.gameOver = false;
+  room.roundStartAt = now + COUNTDOWN_MS;
+  room.suddenDeathAt = room.roundStartAt + SUDDEN_DEATH_MS;
+  room.suddenDeathOn = false;
+  room.nextShrinkAt = 0;
+  room.shrinkIndex = 0;
+
+  let i = 0;
+  room.players.forEach(p => {
+    resetPlayer(p, i++);
+    sendTo(p.ws, {
+      type: 'roundStart',
+      round: room.round,
+      map: room.map,
+      spawn: { x: p.x, y: p.y },
+      countdownMs: COUNTDOWN_MS,
+      scores: scoreList(room),
+    });
+  });
+}
+
+function startMatch(room) {
+  room.gameStarted = true;
+  room.round = 1;
+  room.players.forEach(p => { p.wins = 0; });
+  startRound(room);
+}
+
+function checkRoundOver(room) {
+  if (room.gameOver || !room.gameStarted) return;
   const alivePlayers = [...room.players.values()].filter(p => p.alive);
   if (alivePlayers.length <= 1 && room.players.size > 1) {
     room.gameOver = true;
     const winner = alivePlayers[0] || null;
-    broadcastAll(room, {
-      type: 'gameOver',
-      winnerId: winner ? winner.id : null,
-      winnerName: winner ? winner.name : null,
-    });
+    if (winner) winner.wins = (winner.wins || 0) + 1;
+
+    if (winner && winner.wins >= WINS_NEEDED) {
+      broadcastAll(room, {
+        type: 'matchOver',
+        winnerId: winner.id,
+        winnerName: winner.name,
+        scores: scoreList(room),
+      });
+    } else {
+      room.round++;
+      broadcastAll(room, {
+        type: 'roundOver',
+        winnerId: winner ? winner.id : null,
+        winnerName: winner ? winner.name : null,
+        scores: scoreList(room),
+        nextRound: room.round,
+      });
+      setTimeout(() => {
+        if (rooms.get(room.id) !== room) return;
+        const humans = [...room.players.values()].filter(p => !p.isBot);
+        if (humans.length === 0) return;
+        if (room.players.size >= 2) {
+          startRound(room);
+        } else {
+          room.gameStarted = false;
+          broadcastAll(room, { type: 'waiting' });
+        }
+      }, ROUND_BREAK_MS);
+    }
   }
+}
+
+// One tile of the arena collapses (sudden death)
+function shrinkStep(room) {
+  const tile = SHRINK_ORDER[room.shrinkIndex++];
+  if (!tile) return;
+  const { x, y } = tile;
+  room.map[y][x] = TILE_WALL;
+  room.bombs = room.bombs.filter(b => !(b.x === x && b.y === y));
+  room.powerups = room.powerups.filter(pu => !(pu.x === x && pu.y === y));
+  room.lanterns.forEach(l => {
+    if (l.x === x && l.y === y) l.alive = false;
+  });
+  broadcastAll(room, { type: 'shrink', x, y });
+
+  room.players.forEach(p => {
+    if (p.alive && Math.round(p.x) === x && Math.round(p.y) === y) {
+      p.alive = false;
+      broadcastAll(room, { type: 'playerDied', playerId: p.id });
+      checkRoundOver(room);
+    }
+  });
 }
 
 function collectPowerups(room, player) {
@@ -736,8 +871,7 @@ wss.on('connection', (ws) => {
 
         // Auto-start when 2+ players
         if (room.players.size >= 2 && !room.gameStarted) {
-          room.gameStarted = true;
-          broadcastAll(room, { type: 'gameStarted' });
+          startMatch(room);
         }
         break;
       }
@@ -745,9 +879,10 @@ wss.on('connection', (ws) => {
       case 'move': {
         if (!currentRoom || currentPlayerId === null) return;
         const player = currentRoom.players.get(currentPlayerId);
-        if (!player || !player.alive || !currentRoom.gameStarted) return;
+        if (!player || !player.alive || !currentRoom.gameStarted || currentRoom.gameOver) return;
 
         const now = Date.now();
+        if (now < currentRoom.roundStartAt) return; // countdown
         let { x, y } = msg;
         if (typeof x !== 'number' || typeof y !== 'number') return;
         // Keep the body fully inside the walkable area (border walls at 0 / max)
@@ -781,7 +916,8 @@ wss.on('connection', (ws) => {
       case 'placeBomb': {
         if (!currentRoom || currentPlayerId === null) return;
         const player = currentRoom.players.get(currentPlayerId);
-        if (!player || !player.alive || !currentRoom.gameStarted) return;
+        if (!player || !player.alive || !currentRoom.gameStarted || currentRoom.gameOver) return;
+        if (Date.now() < currentRoom.roundStartAt) return; // countdown
         placeBomb(currentRoom, player);
         break;
       }
@@ -790,8 +926,7 @@ wss.on('connection', (ws) => {
         if (!currentRoom || currentPlayerId === null) return;
         if (addBot(currentRoom)) {
           if (currentRoom.players.size >= 2 && !currentRoom.gameStarted) {
-            currentRoom.gameStarted = true;
-            broadcastAll(currentRoom, { type: 'gameStarted' });
+            startMatch(currentRoom);
           }
         } else {
           sendTo(ws, { type: 'error', message: 'Raum ist voll!' });
@@ -805,6 +940,7 @@ wss.on('connection', (ws) => {
         if (!player || !player.alive || !currentRoom.gameStarted) return;
 
         const now = Date.now();
+        if (now < currentRoom.roundStartAt || currentRoom.gameOver) return;
         if (player.shadowMeter >= 1 && now >= player.shadowCooldownUntil && !isShadowForm(player, now)) {
           player.shadowMeter = 0;
           player.shadowFormUntil = now + SHADOW_FORM_MS;
@@ -814,27 +950,15 @@ wss.on('connection', (ws) => {
       }
 
       case 'restart': {
-        if (!currentRoom) return;
-        currentRoom.map = generateMap();
-        currentRoom.bombs = [];
-        currentRoom.explosions = [];
-        currentRoom.powerups = [];
-        currentRoom.footprints = [];
-        currentRoom.flashes = [];
-        currentRoom.lanterns = createLanterns();
-        currentRoom.gameOver = false;
-        currentRoom.gameStarted = currentRoom.players.size >= 2;
-
-        let i = 0;
-        currentRoom.players.forEach((p) => {
-          resetPlayer(p, i++);
-          sendTo(p.ws, {
-            type: 'restart',
-            map: currentRoom.map,
-            spawn: { x: p.x, y: p.y },
-            gameStarted: currentRoom.gameStarted,
-          });
-        });
+        // New match — only allowed once the current round/match is over
+        if (!currentRoom || !currentRoom.gameOver) return;
+        if (currentRoom.players.size >= 2) {
+          startMatch(currentRoom);
+        } else {
+          currentRoom.gameStarted = false;
+          currentRoom.gameOver = false;
+          broadcastAll(currentRoom, { type: 'waiting' });
+        }
         break;
       }
     }
@@ -850,7 +974,7 @@ wss.on('connection', (ws) => {
     if (humans.length === 0) {
       rooms.delete(currentRoom.id);
     } else {
-      checkGameOver(currentRoom);
+      checkRoundOver(currentRoom);
     }
   });
 });

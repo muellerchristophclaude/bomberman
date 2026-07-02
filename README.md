@@ -15,6 +15,9 @@ Vollständiges Spielkonzept: [docs/SHADOW_BOMBER_KONZEPT.md](docs/SHADOW_BOMBER_
 - **Explosionsblitz:** Jede Explosion erhellt kurz die Umgebung — Aufklärung und Waffe zugleich
 - **Fair trotz Unsichtbarkeit:** Fußspuren, Bombenglühen in der letzten Sekunde und Geräusch-Richtungspfeile verraten versteckte Gegner
 - **Computer-Gegner:** 0–3 Bots pro Raum — sie jagen Spieler, sprengen Blöcke, sammeln Power-ups und fliehen vor Explosionen (serverseitige BFS-Pfadsuche mit Gefahrenkarte)
+- **Best-of-3-Rundensystem:** Countdown vor jeder Runde, Punktestand in der Info-Leiste, wer zuerst 2 Runden gewinnt, holt das Match
+- **Sudden Death:** Nach 2 Minuten stürzt die Arena spiralförmig von außen ein — passive Runden gibt es nicht
+- **Sound & Effekte:** Synthetisierte Sounds (Web Audio, keine Dateien), Screenshake, Partikel bei Explosionen und zerstörten Blöcken — stummschaltbar per 🔊-Button
 - Mehrere Räume, zufällige Karten, Kettenreaktionen, Power-ups, Mobile-Touch-Controls
 
 ## Setup (lokal)
