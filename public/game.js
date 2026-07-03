@@ -32,7 +32,9 @@ let me = {
   x: 1, y: 1, alive: true, speed: 0.08,
   lightRadius: 3, shadowMeter: 0, shadowForm: false,
   cooldownMs: 0, inShadow: false,
+  role: null, ghost: false,
 };
+let gameMode = 'classic';
 let meSpawned = false;
 
 // Server-filtered snapshot data
@@ -216,6 +218,7 @@ function gameLoop(ts) {
 
 function blockedTile(tx, ty) {
   if (tx < 0 || tx >= GRID_WIDTH || ty < 0 || ty >= GRID_HEIGHT) return true;
+  if (me.ghost) return false; // ghosts float through everything
   if (!map[ty]) return true;
   const tile = map[ty][tx];
   if (tile === TILE_WALL) return true;
@@ -237,7 +240,7 @@ const clampX = (x) => Math.max(1, Math.min(GRID_WIDTH - 2, x));
 const clampY = (y) => Math.max(1, Math.min(GRID_HEIGHT - 2, y));
 
 function handleMovement(dt, ts) {
-  if (!me.alive || !gameStarted || !meSpawned) return;
+  if ((!me.alive && !me.ghost) || !gameStarted || !meSpawned) return;
   if (performance.now() < moveLockedUntil) return; // round countdown
 
   let dx = 0, dy = 0;
@@ -628,6 +631,7 @@ function drawPlayerBody(player, isMe) {
   const cx = player.x * CELL_SIZE + CELL_SIZE / 2;
   const cy = player.y * CELL_SIZE + CELL_SIZE / 2;
   const r = CELL_SIZE * 0.38;
+  const isGhost = player.ghost || (isMe && me.ghost);
 
   ctx.save();
   ctx.translate(cx, cy);
@@ -635,19 +639,24 @@ function drawPlayerBody(player, isMe) {
   if (isMe && me.shadowForm) {
     ctx.globalAlpha = 0.45;
   }
+  if (isGhost) {
+    ctx.globalAlpha = 0.45;
+  }
 
-  // Shadow
-  ctx.fillStyle = 'rgba(0,0,0,0.35)';
-  ctx.beginPath();
-  ctx.ellipse(3, r * 0.7, r * 0.7, r * 0.3, 0, 0, Math.PI * 2);
-  ctx.fill();
+  // Shadow (ghosts float — no drop shadow)
+  if (!isGhost) {
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath();
+    ctx.ellipse(3, r * 0.7, r * 0.7, r * 0.3, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
 
   // Body
   ctx.beginPath();
   ctx.arc(0, 0, r, 0, Math.PI * 2);
-  ctx.fillStyle = isMe && me.shadowForm ? '#3a2a5a' : player.color;
+  ctx.fillStyle = isGhost ? '#cfd8ff' : (isMe && me.shadowForm ? '#3a2a5a' : player.color);
   ctx.fill();
-  ctx.strokeStyle = isMe && me.shadowForm ? '#b48cff' : 'rgba(255,255,255,0.5)';
+  ctx.strokeStyle = isGhost ? 'rgba(220,230,255,0.8)' : (isMe && me.shadowForm ? '#b48cff' : 'rgba(255,255,255,0.5)');
   ctx.lineWidth = 2;
   ctx.stroke();
 
@@ -670,15 +679,20 @@ function drawPlayerBody(player, isMe) {
   ctx.arc(r * 0.27, -r * 0.08, r * 0.08, 0, Math.PI * 2);
   ctx.fill();
 
-  // Name label
+  // Name label (with role marker in hunt mode)
+  let label = player.name;
+  if (gameMode === 'hunt') {
+    if (isGhost) label = `👻 ${player.name}`;
+    else if (player.role === 'shadow' || (isMe && me.role === 'shadow')) label = `🌑 ${player.name}`;
+  }
   ctx.fillStyle = 'rgba(0,0,0,0.6)';
   ctx.font = '11px monospace';
-  const nameW = ctx.measureText(player.name).width + 8;
+  const nameW = ctx.measureText(label).width + 8;
   ctx.fillRect(-nameW / 2, -r - 20, nameW, 16);
   ctx.fillStyle = '#fff';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(player.name, 0, -r - 12);
+  ctx.fillText(label, 0, -r - 12);
 
   // "ME" indicator
   if (isMe) {
@@ -696,8 +710,13 @@ function drawPlayerBody(player, isMe) {
 
 function drawPlayers() {
   Object.values(others).forEach(o => drawPlayerBody(o, false));
-  if (meSpawned && me.alive) {
-    drawPlayerBody({ x: me.x, y: me.y, color: roster[myId] ? roster[myId].color : '#fff', name: roster[myId] ? roster[myId].name : '' }, true);
+  if (meSpawned && (me.alive || me.ghost)) {
+    drawPlayerBody({
+      x: me.x, y: me.y,
+      color: roster[myId] ? roster[myId].color : '#fff',
+      name: roster[myId] ? roster[myId].name : '',
+      role: me.role, ghost: me.ghost,
+    }, true);
   }
 }
 
@@ -722,10 +741,18 @@ function drawDarkness() {
     darkCtx.fillRect(px - pr, py - pr, pr * 2, pr * 2);
   };
 
-  if (meSpawned && me.alive) punch(me.x, me.y, me.lightRadius);
-  if (!me.alive) {
+  if (meSpawned && (me.alive || me.ghost)) punch(me.x, me.y, me.lightRadius);
+  if (!me.alive && !me.ghost) {
     // Spectators see everything dimly — punch a huge hole
     punch(GRID_WIDTH / 2, GRID_HEIGHT / 2, GRID_WIDTH);
+  }
+  // Hunt mode: teammates (hunters & ghosts) share their light
+  if (gameMode === 'hunt' && me.role !== 'shadow') {
+    Object.values(others).forEach(o => {
+      if (o.role !== 'shadow' && (o.role === 'hunter' || o.ghost)) {
+        punch(o.x, o.y, o.lightR || 3);
+      }
+    });
   }
   lanterns.forEach(l => { if (l.alive) punch(l.x, l.y, LANTERN_RADIUS, 0.4); });
   flashes.forEach(f => {
@@ -747,7 +774,7 @@ function drawDarkness() {
 
 // Tiles never seen are pitch black (memory fog)
 function drawUnseen() {
-  if (!me.alive) return; // spectators see the whole map
+  if (!me.alive && !me.ghost) return; // spectators see the whole map
   ctx.fillStyle = '#000005';
   for (let y = 0; y < GRID_HEIGHT; y++) {
     for (let x = 0; x < GRID_WIDTH; x++) {
@@ -805,10 +832,13 @@ function updateInfoBar() {
   Object.values(roster).forEach(p => {
     const div = document.createElement('div');
     div.className = 'player-info' + (p.alive ? '' : ' dead');
+    const roleIcon = gameMode === 'hunt'
+      ? (p.role === 'shadow' ? '🌑' : (p.ghost ? '👻' : '🔦')) + ' '
+      : '';
     div.innerHTML = `
       <div class="player-dot" style="background:${p.color}"></div>
-      <span>${p.name}</span>
-      <span title="Runden gewonnen">🏆${p.wins || 0}</span>
+      <span>${roleIcon}${p.name}</span>
+      <span title="Punkte">🏆${p.wins || 0}</span>
       <span title="Bomben">💣${p.maxBombs}</span>
       <span title="Flamme">🔥${p.flameSize}</span>
     `;
@@ -837,15 +867,17 @@ function updateInfoBar() {
 
 // Round countdown overlay (3-2-1-LOS)
 let countdownTimers = [];
-function runCountdown(ms, round, scores) {
+function runCountdown(ms, round, scores, roleLine = '') {
   countdownTimers.forEach(clearTimeout);
   countdownTimers = [];
   const scoreLine = scores.map(s => `${s.name}: ${s.wins}`).join(' · ');
+  const roleHtml = roleLine ? `<p style="color:#b48cff; font-weight:bold">${roleLine}</p>` : '';
   const stepMs = (ms - 100) / 3;
   [3, 2, 1].forEach((n, i) => {
     countdownTimers.push(setTimeout(() => {
       showOverlay(`
         <p style="color:#aaa">Runde ${round}</p>
+        ${roleHtml}
         <h2 style="font-size:3.5rem">${n}</h2>
         <p style="color:#888; font-size:0.85rem">${scoreLine}</p>
       `);
@@ -863,6 +895,15 @@ function updateShadowMeterUI() {
   const fill = document.getElementById('shadow-meter-fill');
   const label = document.getElementById('shadow-meter-label');
   if (!fill) return;
+
+  // Hunt mode: hunters and ghosts have no shadow meter — show the role instead
+  if (gameMode === 'hunt' && me.role !== 'shadow') {
+    fill.style.width = '0%';
+    label.textContent = me.ghost
+      ? '👻 Geist — schwebe umher und leuchte deinem Team!'
+      : '🔦 Jäger — findet und sprengt den Shadow Bomber!';
+    return;
+  }
 
   fill.style.width = `${Math.round(me.shadowMeter * 100)}%`;
 
@@ -904,7 +945,8 @@ function joinGame() {
   ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
-    ws.send(JSON.stringify({ type: 'join', name, roomId }));
+    const mode = document.getElementById('gameMode').value || 'classic';
+    ws.send(JSON.stringify({ type: 'join', name, roomId, mode }));
   };
 
   ws.onmessage = (e) => {
@@ -927,6 +969,7 @@ function handleMessage(msg) {
     case 'joined':
       myId = msg.playerId;
       map = msg.map;
+      gameMode = msg.mode || 'classic';
       gameStarted = msg.gameStarted;
       gameOver = msg.gameOver;
       me.x = msg.spawn.x;
@@ -974,10 +1017,13 @@ function handleMessage(msg) {
       noises = msg.noises;
       gameStarted = msg.gameStarted;
       gameOver = msg.gameOver;
+      gameMode = msg.mode || 'classic';
       roundNum = msg.round;
       suddenDeathOn = msg.suddenDeathOn;
       suddenDeathMs = msg.suddenDeathMs;
 
+      me.role = msg.you.role;
+      me.ghost = msg.you.ghost;
       me.shadowMeter = msg.you.shadowMeter;
       me.shadowForm = msg.you.shadowForm;
       me.cooldownMs = msg.you.cooldownMs;
@@ -998,8 +1044,14 @@ function handleMessage(msg) {
           others[p.id].tx = p.x;
           others[p.id].ty = p.y;
           others[p.id].name = p.name;
+          others[p.id].role = p.role;
+          others[p.id].ghost = p.ghost;
+          others[p.id].lightR = p.lightR;
         } else {
-          others[p.id] = { x: p.x, y: p.y, tx: p.x, ty: p.y, color: p.color, name: p.name, id: p.id };
+          others[p.id] = {
+            x: p.x, y: p.y, tx: p.x, ty: p.y, color: p.color, name: p.name, id: p.id,
+            role: p.role, ghost: p.ghost, lightR: p.lightR,
+          };
         }
         stillVisible[p.id] = true;
       });
@@ -1057,11 +1109,19 @@ function handleMessage(msg) {
       if (msg.playerId === myId) {
         me.alive = false;
         addShake(8);
-        showOverlay(`
-          <h2 style="color:#e74c3c">Du bist gestorben!</h2>
-          <p style="color:#aaa">Zuschauen...</p>
-        `);
-        setTimeout(hideOverlay, 2000);
+        if (msg.ghost) {
+          me.ghost = true;
+          showOverlay(`
+            <h2 style="color:#cfd8ff">👻 Du bist jetzt ein Geist!</h2>
+            <p style="color:#aaa">Schwebe durch die Arena und leuchte deinem Team den Weg</p>
+          `);
+        } else {
+          showOverlay(`
+            <h2 style="color:#e74c3c">Du bist gestorben!</h2>
+            <p style="color:#aaa">Zuschauen...</p>
+          `);
+        }
+        setTimeout(hideOverlay, 2500);
       } else if (roster[msg.playerId]) {
         showPickupToast(`💀 ${roster[msg.playerId].name} wurde erwischt!`);
       }
@@ -1081,12 +1141,15 @@ function handleMessage(msg) {
     case 'roundStart':
       map = msg.map;
       roundNum = msg.round;
+      gameMode = msg.mode || 'classic';
       gameStarted = true;
       gameOver = false;
       suddenDeathOn = false;
       me.x = msg.spawn.x;
       me.y = msg.spawn.y;
       me.alive = true;
+      me.ghost = false;
+      me.role = msg.role;
       meSpawned = true;
       bombs = [];
       glows = [];
@@ -1096,18 +1159,34 @@ function handleMessage(msg) {
       particles = [];
       resetSeen();
       moveLockedUntil = performance.now() + msg.countdownMs;
-      runCountdown(msg.countdownMs, msg.round, msg.scores);
+      {
+        let roleLine = '';
+        if (msg.mode === 'hunt') {
+          roleLine = msg.role === 'shadow'
+            ? '🌑 DU bist der Shadow Bomber — bleib im Dunkeln!'
+            : `🔦 Jagt ${msg.shadowName || 'den Shadow Bomber'}!`;
+        }
+        runCountdown(msg.countdownMs, msg.round, msg.scores, roleLine);
+      }
       break;
 
     case 'roundOver': {
       gameOver = true;
       const line = msg.scores.map(s => `${s.name}: ${s.wins}`).join(' · ');
-      const mine = msg.winnerId === myId;
+      let title, mine;
+      if (msg.side) {
+        // Hunt mode: a side wins, not a single player
+        mine = (me.role === 'shadow') === (msg.side === 'shadow');
+        title = msg.side === 'shadow'
+          ? `🌑 ${msg.shadowName} (Shadow Bomber) gewinnt die Runde!`
+          : '🔦 Die Jäger gewinnen die Runde!';
+      } else {
+        mine = msg.winnerId === myId;
+        title = msg.winnerId === null ? 'Unentschieden!' :
+          mine ? '🏆 Runde gewonnen!' : `${msg.winnerName} gewinnt die Runde!`;
+      }
       showOverlay(`
-        <h2 style="color:${mine ? '#2ecc71' : '#b48cff'}">${
-          msg.winnerId === null ? 'Unentschieden!' :
-          mine ? '🏆 Runde gewonnen!' : `${msg.winnerName} gewinnt die Runde!`
-        }</h2>
+        <h2 style="color:${mine ? '#2ecc71' : '#b48cff'}">${title}</h2>
         <p>${line}</p>
         <p style="color:#888">Nächste Runde startet gleich...</p>
       `);
@@ -1121,12 +1200,13 @@ function handleMessage(msg) {
       const mine = msg.winnerId === myId;
       showOverlay(`
         <h2 style="color:${mine ? '#2ecc71' : '#b48cff'}">${
+          msg.winnerId === null ? 'Unentschieden!' :
           mine ? '🏆 Du gewinnst das Match!' : `${msg.winnerName} gewinnt das Match!`
         }</h2>
         <p>${line}</p>
         <button onclick="restartGame()">Nochmal spielen</button>
       `);
-      sfx[mine ? 'win' : 'lose']();
+      sfx[mine && msg.winnerId !== null ? 'win' : 'lose']();
       break;
     }
 

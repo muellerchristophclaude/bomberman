@@ -32,8 +32,14 @@ const SHADOW_CHARGE_MS = 3000;
 const SHADOW_FORM_MS = 4000;
 const SHADOW_COOLDOWN_MS = 10000;
 
+// Hunt mode (Schattenjagd): everyone vs. one Shadow Bomber
+const GHOST_LIGHT_RADIUS = 2;
+const SHADOW_HUNT_SPEED = 0.088;  // +10% for the lone shadow
+const HUNT_WIN_POINTS_SHADOW = 2; // alone vs. many — a win is worth more
+const HUNT_WIN_POINTS_HUNTER = 1;
+
 // Rounds & sudden death
-const WINS_NEEDED = 2;            // best-of-3
+const WINS_NEEDED = 2;            // best-of-3 (classic mode)
 const COUNTDOWN_MS = 3000;
 const ROUND_BREAK_MS = 4000;
 const SUDDEN_DEATH_MS = parseInt(process.env.SUDDEN_DEATH_MS, 10) || 120000; // 2 min after round start
@@ -132,9 +138,12 @@ function createLanterns() {
   return LANTERN_SPOTS.map((spot, i) => ({ id: i, x: spot.x, y: spot.y, alive: true }));
 }
 
-function createRoom(roomId) {
+function createRoom(roomId, mode) {
   return {
     id: roomId,
+    mode: mode === 'hunt' ? 'hunt' : 'classic',
+    shadowQueue: [],
+    rotationIdx: 0,
     players: new Map(),
     bombs: [],
     explosions: [],
@@ -155,9 +164,9 @@ function createRoom(roomId) {
   };
 }
 
-function getRoom(roomId) {
+function getRoom(roomId, mode) {
   if (!rooms.has(roomId)) {
-    rooms.set(roomId, createRoom(roomId));
+    rooms.set(roomId, createRoom(roomId, mode));
   }
   return rooms.get(roomId);
 }
@@ -190,6 +199,14 @@ function isShadowForm(player, now) {
 // Is the tile/position (x, y) lit from the viewer's perspective?
 function isLitFor(room, viewer, x, y, now) {
   if (dist(viewer.x, viewer.y, x, y) <= viewer.lightRadius) return true;
+  // Hunt mode: hunters and ghosts share their light as a team
+  if (room.mode === 'hunt' && viewer.role !== 'shadow') {
+    for (const [, p] of room.players) {
+      if (p.id === viewer.id || p.role === 'shadow') continue;
+      if (!p.alive && !p.ghost) continue;
+      if (dist(p.x, p.y, x, y) <= p.lightRadius) return true;
+    }
+  }
   for (const lantern of room.lanterns) {
     if (lantern.alive && dist(lantern.x, lantern.y, x, y) <= LANTERN_RADIUS) return true;
   }
@@ -209,7 +226,8 @@ function computeInShadow(room, player, now) {
     if (flash.until > now && dist(flash.x, flash.y, player.x, player.y) <= flash.r) return false;
   }
   for (const [, other] of room.players) {
-    if (other.id === player.id || !other.alive) continue;
+    if (other.id === player.id) continue;
+    if (!other.alive && !other.ghost) continue; // ghosts glow too
     if (dist(other.x, other.y, player.x, player.y) <= other.lightRadius) return false;
   }
   return true;
@@ -234,27 +252,38 @@ function buildSnapshot(room, viewer, now) {
       maxBombs: p.maxBombs,
       flameSize: p.flameSize,
       wins: p.wins || 0,
+      role: p.role || null,
+      ghost: !!p.ghost,
     };
   });
 
   // Players: only those the viewer is allowed to see
   const players = {};
   room.players.forEach((p, id) => {
-    if (!p.alive) return;
-    if (id !== viewer.id && isShadowForm(p, now)) return; // shadow form: invisible even in light
-    if (id === viewer.id || isLitFor(room, viewer, p.x, p.y, now)) {
-      players[id] = { id, x: p.x, y: p.y, color: p.color, name: p.name };
+    if (!p.alive && !p.ghost) return;
+    if (id !== viewer.id && p.alive && isShadowForm(p, now)) return; // shadow form: invisible even in light
+    // Ghosts glow — they're always visible; everyone else needs light
+    if (id === viewer.id || p.ghost || isLitFor(room, viewer, p.x, p.y, now)) {
+      players[id] = {
+        id, x: p.x, y: p.y, color: p.color, name: p.name,
+        role: p.role || null, ghost: !!p.ghost, lightR: p.lightRadius,
+      };
     }
   });
 
   // Bombs: fully visible when lit; unlit bombs only appear as a faint glow
-  // during their last second
+  // during their last second. The Shadow Bomber's bombs never glow for
+  // hunters — his bombs are silent and dark.
   const bombs = [];
   const glows = [];
   for (const b of room.bombs) {
     if (isLitFor(room, viewer, b.x, b.y, now)) {
       bombs.push({ id: b.id, x: b.x, y: b.y });
     } else {
+      if (room.mode === 'hunt' && viewer.role !== 'shadow') {
+        const owner = room.players.get(b.playerId);
+        if (owner && owner.role === 'shadow') continue;
+      }
       const remaining = b.explodeAt - now;
       if (remaining <= BOMB_GLOW_MS) {
         glows.push({ id: b.id, x: b.x, y: b.y, remaining });
@@ -288,7 +317,10 @@ function buildSnapshot(room, viewer, now) {
       inShadow: viewer.inShadow,
       speed: viewer.speed,
       alive: viewer.alive,
+      role: viewer.role || null,
+      ghost: !!viewer.ghost,
     },
+    mode: room.mode,
     roster,
     players,
     bombs,
@@ -419,8 +451,13 @@ function planBot(room, bot, now) {
   }
 
   // Shadow-form players are invisible — bots don't target them either
-  const enemies = [...room.players.values()]
+  let enemies = [...room.players.values()]
     .filter(p => p.id !== bot.id && p.alive && !isShadowForm(p, now));
+  // Hunt mode: hunters only target the shadow, the shadow only hunts hunters
+  if (room.mode === 'hunt') {
+    enemies = enemies.filter(p =>
+      bot.role === 'shadow' ? p.role === 'hunter' : p.role === 'shadow');
+  }
 
   // 2) Drop a bomb when an enemy is in blast range or a block is adjacent,
   //    but only if a safe escape route exists afterwards
@@ -533,6 +570,7 @@ function tickRoom(room, now) {
   room.players.forEach(p => {
     if (!p.alive) return;
     p.inShadow = computeInShadow(room, p, now);
+    if (room.mode === 'hunt' && p.role !== 'shadow') return; // only the shadow charges
     if (
       room.gameStarted && !room.gameOver &&
       p.inShadow && !isShadowForm(p, now) && now >= p.shadowCooldownUntil
@@ -580,7 +618,10 @@ function placeBomb(room, player) {
   if (room.bombs.find(b => b.x === bx && b.y === by)) return;
 
   player.bombCount++;
-  player.lastActionAt = Date.now();
+  // The Shadow Bomber places bombs silently — no noise hint for hunters
+  if (!(room.mode === 'hunt' && player.role === 'shadow')) {
+    player.lastActionAt = Date.now();
+  }
 
   const bomb = {
     id: Date.now() + Math.random(),
@@ -653,14 +694,12 @@ function explodeBomb(room, bomb) {
   // The blast lights up the surroundings for a moment
   room.flashes.push({ x: bomb.x, y: bomb.y, r: FLASH_RADIUS, until: now + FLASH_DURATION });
 
-  // Check player hits (shadow form does NOT protect)
+  // Check player hits (shadow form does NOT protect; ghosts can't die)
   room.players.forEach((p) => {
     if (!p.alive) return;
     const hit = cells.find(c => Math.abs(c.x - Math.round(p.x)) < 0.6 && Math.abs(c.y - Math.round(p.y)) < 0.6);
     if (hit) {
-      p.alive = false;
-      broadcastAll(room, { type: 'playerDied', playerId: p.id });
-      checkRoundOver(room);
+      killPlayer(room, p);
     }
   });
 
@@ -694,9 +733,32 @@ function startRound(room) {
   room.nextShrinkAt = 0;
   room.shrinkIndex = 0;
 
+  // Hunt mode: rotate the Shadow Bomber role through the queue
+  let shadowName = null;
+  if (room.mode === 'hunt') {
+    let shadowId = null;
+    while (room.rotationIdx < room.shadowQueue.length) {
+      const cand = room.shadowQueue[room.rotationIdx++];
+      if (room.players.has(cand)) { shadowId = cand; break; }
+    }
+    if (shadowId === null) {
+      room.shadowQueue = [...room.players.keys()];
+      room.rotationIdx = 1;
+      shadowId = room.shadowQueue[0];
+    }
+    room.players.forEach((p, id) => {
+      p.role = id === shadowId ? 'shadow' : 'hunter';
+    });
+    const shadow = room.players.get(shadowId);
+    shadowName = shadow ? shadow.name : null;
+  }
+
   let i = 0;
   room.players.forEach(p => {
     resetPlayer(p, i++);
+    if (room.mode === 'hunt' && p.role === 'shadow') {
+      p.speed = SHADOW_HUNT_SPEED;
+    }
     sendTo(p.ws, {
       type: 'roundStart',
       round: room.round,
@@ -704,6 +766,9 @@ function startRound(room) {
       spawn: { x: p.x, y: p.y },
       countdownMs: COUNTDOWN_MS,
       scores: scoreList(room),
+      mode: room.mode,
+      role: p.role || null,
+      shadowName,
     });
   });
 }
@@ -712,11 +777,93 @@ function startMatch(room) {
   room.gameStarted = true;
   room.round = 1;
   room.players.forEach(p => { p.wins = 0; });
+  if (room.mode === 'hunt') {
+    room.shadowQueue = [...room.players.keys()];
+    room.rotationIdx = 0;
+  }
   startRound(room);
+}
+
+// Central death handling: in hunt mode dead hunters turn into ghosts —
+// floating team light sources that can't bomb, collect or die
+function killPlayer(room, p) {
+  p.alive = false;
+  if (room.mode === 'hunt' && p.role === 'hunter') {
+    p.ghost = true;
+    p.lightRadius = GHOST_LIGHT_RADIUS;
+  }
+  broadcastAll(room, { type: 'playerDied', playerId: p.id, ghost: !!p.ghost });
+  checkRoundOver(room);
+}
+
+function scheduleNextRound(room) {
+  setTimeout(() => {
+    if (rooms.get(room.id) !== room) return;
+    const humans = [...room.players.values()].filter(p => !p.isBot);
+    if (humans.length === 0) return;
+    if (room.players.size >= 2) {
+      startRound(room);
+    } else {
+      room.gameStarted = false;
+      broadcastAll(room, { type: 'waiting' });
+    }
+  }, ROUND_BREAK_MS);
+}
+
+// Hunt mode round end: hunters win the moment the Shadow Bomber dies,
+// the shadow wins when every hunter is a ghost. Match ends after a full
+// rotation (everyone was shadow once); highest score wins.
+function checkRoundOverHunt(room) {
+  const players = [...room.players.values()];
+  const shadow = players.find(p => p.role === 'shadow');
+  const huntersAlive = players.filter(p => p.role === 'hunter' && p.alive);
+
+  let side = null;
+  if (!shadow || !shadow.alive) side = 'hunters';
+  else if (huntersAlive.length === 0) side = 'shadow';
+  if (!side) return;
+
+  room.gameOver = true;
+  if (side === 'shadow') {
+    shadow.wins = (shadow.wins || 0) + HUNT_WIN_POINTS_SHADOW;
+  } else {
+    players.forEach(p => {
+      if (p.role === 'hunter') p.wins = (p.wins || 0) + HUNT_WIN_POINTS_HUNTER;
+    });
+  }
+
+  const shadowName = shadow ? shadow.name : '';
+  const matchDone = room.rotationIdx >= room.shadowQueue.length;
+  if (matchDone) {
+    const maxWins = Math.max(...players.map(p => p.wins || 0));
+    const leaders = players.filter(p => (p.wins || 0) === maxWins);
+    const winner = leaders.length === 1 ? leaders[0] : null;
+    broadcastAll(room, {
+      type: 'matchOver',
+      winnerId: winner ? winner.id : null,
+      winnerName: winner ? winner.name : null,
+      scores: scoreList(room),
+      side,
+      shadowName,
+    });
+  } else {
+    room.round++;
+    broadcastAll(room, {
+      type: 'roundOver',
+      winnerId: null,
+      winnerName: null,
+      scores: scoreList(room),
+      nextRound: room.round,
+      side,
+      shadowName,
+    });
+    scheduleNextRound(room);
+  }
 }
 
 function checkRoundOver(room) {
   if (room.gameOver || !room.gameStarted) return;
+  if (room.mode === 'hunt') return checkRoundOverHunt(room);
   const alivePlayers = [...room.players.values()].filter(p => p.alive);
   if (alivePlayers.length <= 1 && room.players.size > 1) {
     room.gameOver = true;
@@ -739,17 +886,7 @@ function checkRoundOver(room) {
         scores: scoreList(room),
         nextRound: room.round,
       });
-      setTimeout(() => {
-        if (rooms.get(room.id) !== room) return;
-        const humans = [...room.players.values()].filter(p => !p.isBot);
-        if (humans.length === 0) return;
-        if (room.players.size >= 2) {
-          startRound(room);
-        } else {
-          room.gameStarted = false;
-          broadcastAll(room, { type: 'waiting' });
-        }
-      }, ROUND_BREAK_MS);
+      scheduleNextRound(room);
     }
   }
 }
@@ -769,9 +906,7 @@ function shrinkStep(room) {
 
   room.players.forEach(p => {
     if (p.alive && Math.round(p.x) === x && Math.round(p.y) === y) {
-      p.alive = false;
-      broadcastAll(room, { type: 'playerDied', playerId: p.id });
-      checkRoundOver(room);
+      killPlayer(room, p);
     }
   });
 }
@@ -814,6 +949,7 @@ function resetPlayer(player, index) {
   player.inShadow = false;
   player.lastFootprint = null;
   player.lastActionAt = 0;
+  player.ghost = false;
   if (player.isBot) {
     player.path = [];
     player.replanAt = 0;
@@ -836,7 +972,7 @@ wss.on('connection', (ws) => {
     switch (msg.type) {
       case 'join': {
         const roomId = msg.roomId || 'default';
-        const room = getRoom(roomId);
+        const room = getRoom(roomId, msg.mode);
 
         if (room.players.size >= MAX_PLAYERS) {
           sendTo(ws, { type: 'error', message: 'Raum ist voll!' });
@@ -856,6 +992,8 @@ wss.on('connection', (ws) => {
           y: startPos.y,
         };
         resetPlayer(player, currentPlayerId);
+        // Late joiners in a running hunt match are hunters
+        if (room.mode === 'hunt' && room.gameStarted) player.role = 'hunter';
 
         room.players.set(currentPlayerId, player);
 
@@ -863,6 +1001,7 @@ wss.on('connection', (ws) => {
           type: 'joined',
           playerId: currentPlayerId,
           roomId,
+          mode: room.mode,
           map: room.map,
           spawn: { x: player.x, y: player.y },
           gameStarted: room.gameStarted,
@@ -879,7 +1018,8 @@ wss.on('connection', (ws) => {
       case 'move': {
         if (!currentRoom || currentPlayerId === null) return;
         const player = currentRoom.players.get(currentPlayerId);
-        if (!player || !player.alive || !currentRoom.gameStarted || currentRoom.gameOver) return;
+        if (!player || !currentRoom.gameStarted || currentRoom.gameOver) return;
+        if (!player.alive && !player.ghost) return;
 
         const now = Date.now();
         if (now < currentRoom.roundStartAt) return; // countdown
@@ -888,6 +1028,14 @@ wss.on('connection', (ws) => {
         // Keep the body fully inside the walkable area (border walls at 0 / max)
         x = Math.max(1, Math.min(GRID_WIDTH - 2, x));
         y = Math.max(1, Math.min(GRID_HEIGHT - 2, y));
+
+        // Ghosts float through everything — no collision, no footprints,
+        // no power-ups; they're just mobile team lights
+        if (player.ghost) {
+          player.x = x;
+          player.y = y;
+          return;
+        }
 
         const phasing = isShadowForm(player, now);
         if (!checkCollision(currentRoom, x, y, phasing, Math.round(player.x), Math.round(player.y))) {
@@ -941,6 +1089,8 @@ wss.on('connection', (ws) => {
 
         const now = Date.now();
         if (now < currentRoom.roundStartAt || currentRoom.gameOver) return;
+        // Hunt mode: only the Shadow Bomber has the shadow form
+        if (currentRoom.mode === 'hunt' && player.role !== 'shadow') return;
         if (player.shadowMeter >= 1 && now >= player.shadowCooldownUntil && !isShadowForm(player, now)) {
           player.shadowMeter = 0;
           player.shadowFormUntil = now + SHADOW_FORM_MS;
