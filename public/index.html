@@ -103,6 +103,8 @@
       border-radius: 4px;
       image-rendering: pixelated;
       background: #000005;
+      max-width: calc(100vw - 40px);
+      height: auto;
     }
     #overlay {
       position: absolute;
@@ -189,6 +191,14 @@
       <select id="gameMode">
         <option value="classic">Klassisch — Jeder gegen jeden</option>
         <option value="hunt">🌑 Schattenjagd — Alle gegen den Shadow Bomber</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>🗺️ Kartengröße</label>
+      <select id="mapSize">
+        <option value="small">Klein (13×11) — schnelle Duelle</option>
+        <option value="medium" selected>Mittel (15×13) — Standard</option>
+        <option value="large">Groß (21×17) — mehr Platz zum Verstecken</option>
       </select>
     </div>
     <div class="form-group">

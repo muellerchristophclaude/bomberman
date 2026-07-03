@@ -10,8 +10,11 @@ const wss = new WebSocket.Server({ server });
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Game constants
-const GRID_WIDTH = 15;
-const GRID_HEIGHT = 13;
+const MAP_SIZES = {
+  small: { w: 13, h: 11 },
+  medium: { w: 15, h: 13 },
+  large: { w: 21, h: 17 },
+};
 const MAX_PLAYERS = 4;
 const BOMB_TIMER = 3000;
 const EXPLOSION_DURATION = 800;
@@ -56,30 +59,60 @@ const POWERUP_FLAME = 'flame';
 const POWERUP_SPEED = 'speed';
 const POWERUP_TORCH = 'torch';
 
-// Fixed lantern positions (tiles get cleared during map generation)
-const LANTERN_SPOTS = [
-  { x: 7, y: 6 },
-  { x: 3, y: 6 },
-  { x: 11, y: 6 },
-  { x: 7, y: 2 },
-  { x: 7, y: 10 },
-];
-
-// Player start positions
-const START_POSITIONS = [
-  { x: 1, y: 1 },
-  { x: GRID_WIDTH - 2, y: GRID_HEIGHT - 2 },
-  { x: GRID_WIDTH - 2, y: 1 },
-  { x: 1, y: GRID_HEIGHT - 2 },
-];
-
 const START_COLORS = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12'];
+
+// Nudge a spot off the fixed pillar grid (pillars sit at even/even)
+function offPillar(x, y) {
+  if (x % 2 === 0 && y % 2 === 0) x += 1;
+  return { x, y };
+}
+
+// Lantern positions scale with the map: center cross, plus quarter
+// intersections on large maps
+function lanternSpotsFor(w, h) {
+  const cx = Math.floor(w / 2);
+  const cy = Math.floor(h / 2);
+  const qx = Math.floor(w / 4);
+  const qy = Math.floor(h / 4);
+  const spots = [
+    offPillar(cx, cy),
+    offPillar(qx, cy),
+    offPillar(w - 1 - qx, cy),
+    offPillar(cx, qy),
+    offPillar(cx, h - 1 - qy),
+  ];
+  if (w >= 17) {
+    spots.push(
+      offPillar(qx, qy),
+      offPillar(w - 1 - qx, qy),
+      offPillar(qx, h - 1 - qy),
+      offPillar(w - 1 - qx, h - 1 - qy),
+    );
+  }
+  // Dedupe
+  const seen = new Set();
+  return spots.filter(s => {
+    const k = s.x + ',' + s.y;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+function startPositionsFor(w, h) {
+  return [
+    { x: 1, y: 1 },
+    { x: w - 2, y: h - 2 },
+    { x: w - 2, y: 1 },
+    { x: 1, y: h - 2 },
+  ];
+}
 
 // Sudden death: tiles collapse in a clockwise spiral from the outside in
 // (fixed pillars are skipped — they're already solid)
-const SHRINK_ORDER = (() => {
+function buildShrinkOrder(w, h) {
   const order = [];
-  let left = 1, top = 1, right = GRID_WIDTH - 2, bottom = GRID_HEIGHT - 2;
+  let left = 1, top = 1, right = w - 2, bottom = h - 2;
   while (left <= right && top <= bottom) {
     for (let x = left; x <= right; x++) order.push({ x, y: top });
     for (let y = top + 1; y <= bottom; y++) order.push({ x: right, y });
@@ -88,7 +121,7 @@ const SHRINK_ORDER = (() => {
     left++; top++; right--; bottom--;
   }
   return order.filter(t => !(t.x % 2 === 0 && t.y % 2 === 0));
-})();
+}
 
 // Game rooms
 const rooms = new Map();
@@ -97,13 +130,13 @@ function dist(x1, y1, x2, y2) {
   return Math.hypot(x1 - x2, y1 - y2);
 }
 
-function generateMap() {
+function generateMap(w, h, lanternSpots) {
   const map = [];
-  for (let y = 0; y < GRID_HEIGHT; y++) {
+  for (let y = 0; y < h; y++) {
     map[y] = [];
-    for (let x = 0; x < GRID_WIDTH; x++) {
+    for (let x = 0; x < w; x++) {
       // Border walls
-      if (x === 0 || y === 0 || x === GRID_WIDTH - 1 || y === GRID_HEIGHT - 1) {
+      if (x === 0 || y === 0 || x === w - 1 || y === h - 1) {
         map[y][x] = TILE_WALL;
       }
       // Interior fixed walls (every 2 cells)
@@ -113,9 +146,9 @@ function generateMap() {
       // Clear corners for players
       else if (
         (x <= 2 && y <= 2) ||
-        (x >= GRID_WIDTH - 3 && y >= GRID_HEIGHT - 3) ||
-        (x >= GRID_WIDTH - 3 && y <= 2) ||
-        (x <= 2 && y >= GRID_HEIGHT - 3)
+        (x >= w - 3 && y >= h - 3) ||
+        (x >= w - 3 && y <= 2) ||
+        (x <= 2 && y >= h - 3)
       ) {
         map[y][x] = TILE_EMPTY;
       }
@@ -128,20 +161,27 @@ function generateMap() {
     }
   }
   // Keep lantern tiles walkable
-  LANTERN_SPOTS.forEach(({ x, y }) => {
+  lanternSpots.forEach(({ x, y }) => {
     if (map[y][x] !== TILE_WALL) map[y][x] = TILE_EMPTY;
   });
   return map;
 }
 
-function createLanterns() {
-  return LANTERN_SPOTS.map((spot, i) => ({ id: i, x: spot.x, y: spot.y, alive: true }));
+function createLanterns(lanternSpots) {
+  return lanternSpots.map((spot, i) => ({ id: i, x: spot.x, y: spot.y, alive: true }));
 }
 
-function createRoom(roomId, mode) {
+function createRoom(roomId, mode, mapSize) {
+  const size = MAP_SIZES[mapSize] || MAP_SIZES.medium;
+  const lanternSpots = lanternSpotsFor(size.w, size.h);
   return {
     id: roomId,
     mode: mode === 'hunt' ? 'hunt' : 'classic',
+    gridW: size.w,
+    gridH: size.h,
+    lanternSpots,
+    startPositions: startPositionsFor(size.w, size.h),
+    shrinkOrder: buildShrinkOrder(size.w, size.h),
     shadowQueue: [],
     rotationIdx: 0,
     players: new Map(),
@@ -150,8 +190,8 @@ function createRoom(roomId, mode) {
     powerups: [],
     footprints: [],
     flashes: [],
-    lanterns: createLanterns(),
-    map: generateMap(),
+    lanterns: createLanterns(lanternSpots),
+    map: generateMap(size.w, size.h, lanternSpots),
     gameStarted: false,
     gameOver: false,
     round: 1,
@@ -164,9 +204,9 @@ function createRoom(roomId, mode) {
   };
 }
 
-function getRoom(roomId, mode) {
+function getRoom(roomId, mode, mapSize) {
   if (!rooms.has(roomId)) {
-    rooms.set(roomId, createRoom(roomId, mode));
+    rooms.set(roomId, createRoom(roomId, mode, mapSize));
   }
   return rooms.get(roomId);
 }
@@ -359,7 +399,7 @@ function addBot(room) {
     replanAt: 0,
     bombPlacedAt: 0,
   };
-  resetPlayer(bot, id);
+  resetPlayer(room, bot, id);
   room.players.set(id, bot);
   return true;
 }
@@ -372,7 +412,7 @@ function blastCells(room, bomb) {
     for (let i = 1; i <= bomb.flameSize; i++) {
       const nx = bomb.x + dx * i;
       const ny = bomb.y + dy * i;
-      if (nx < 0 || nx >= GRID_WIDTH || ny < 0 || ny >= GRID_HEIGHT) break;
+      if (nx < 0 || nx >= room.gridW || ny < 0 || ny >= room.gridH) break;
       if (room.map[ny][nx] === TILE_WALL) break;
       cells.push({ x: nx, y: ny });
       if (room.map[ny][nx] === TILE_BLOCK) break;
@@ -391,7 +431,7 @@ function computeDanger(room, extraBomb = null) {
 }
 
 function isBotWalkable(room, x, y) {
-  if (x < 0 || x >= GRID_WIDTH || y < 0 || y >= GRID_HEIGHT) return false;
+  if (x < 0 || x >= room.gridW || y < 0 || y >= room.gridH) return false;
   if (room.map[y][x] !== TILE_EMPTY) return false;
   if (room.bombs.some(b => b.x === x && b.y === y)) return false;
   return true;
@@ -432,7 +472,7 @@ function nextToBlock(room, x, y) {
   return [[0, 1], [0, -1], [1, 0], [-1, 0]].some(([dx, dy]) => {
     const nx = x + dx;
     const ny = y + dy;
-    return nx >= 0 && nx < GRID_WIDTH && ny >= 0 && ny < GRID_HEIGHT &&
+    return nx >= 0 && nx < room.gridW && ny >= 0 && ny < room.gridH &&
       room.map[ny][nx] === TILE_BLOCK;
   });
 }
@@ -557,7 +597,7 @@ function tickRoom(room, now) {
       room.nextShrinkAt = now;
       broadcastAll(room, { type: 'suddenDeath' });
     }
-    while (!room.gameOver && now >= room.nextShrinkAt && room.shrinkIndex < SHRINK_ORDER.length) {
+    while (!room.gameOver && now >= room.nextShrinkAt && room.shrinkIndex < room.shrinkOrder.length) {
       room.nextShrinkAt += SHRINK_INTERVAL_MS;
       shrinkStep(room);
     }
@@ -596,7 +636,7 @@ setInterval(() => {
 function checkCollision(room, x, y, phasing, fromTileX = null, fromTileY = null) {
   const tileX = Math.round(x);
   const tileY = Math.round(y);
-  if (tileX < 0 || tileX >= GRID_WIDTH || tileY < 0 || tileY >= GRID_HEIGHT) return true;
+  if (tileX < 0 || tileX >= room.gridW || tileY < 0 || tileY >= room.gridH) return true;
   const tile = room.map[tileY][tileX];
   if (tile === TILE_WALL) return true;
   if (tile === TILE_BLOCK) return !phasing; // shadow form slips through blocks
@@ -655,7 +695,7 @@ function explodeBomb(room, bomb) {
     for (let i = 1; i <= bomb.flameSize; i++) {
       const nx = bomb.x + dx * i;
       const ny = bomb.y + dy * i;
-      if (nx < 0 || nx >= GRID_WIDTH || ny < 0 || ny >= GRID_HEIGHT) break;
+      if (nx < 0 || nx >= room.gridW || ny < 0 || ny >= room.gridH) break;
       if (room.map[ny][nx] === TILE_WALL) break;
       if (room.map[ny][nx] === TILE_BLOCK) {
         cells.push({ x: nx, y: ny });
@@ -719,13 +759,13 @@ function scoreList(room) {
 
 function startRound(room) {
   const now = Date.now();
-  room.map = generateMap();
+  room.map = generateMap(room.gridW, room.gridH, room.lanternSpots);
   room.bombs = [];
   room.explosions = [];
   room.powerups = [];
   room.footprints = [];
   room.flashes = [];
-  room.lanterns = createLanterns();
+  room.lanterns = createLanterns(room.lanternSpots);
   room.gameOver = false;
   room.roundStartAt = now + COUNTDOWN_MS;
   room.suddenDeathAt = room.roundStartAt + SUDDEN_DEATH_MS;
@@ -755,7 +795,7 @@ function startRound(room) {
 
   let i = 0;
   room.players.forEach(p => {
-    resetPlayer(p, i++);
+    resetPlayer(room, p, i++);
     if (room.mode === 'hunt' && p.role === 'shadow') {
       p.speed = SHADOW_HUNT_SPEED;
     }
@@ -893,7 +933,7 @@ function checkRoundOver(room) {
 
 // One tile of the arena collapses (sudden death)
 function shrinkStep(room) {
-  const tile = SHRINK_ORDER[room.shrinkIndex++];
+  const tile = room.shrinkOrder[room.shrinkIndex++];
   if (!tile) return;
   const { x, y } = tile;
   room.map[y][x] = TILE_WALL;
@@ -933,8 +973,8 @@ function collectPowerups(room, player) {
   });
 }
 
-function resetPlayer(player, index) {
-  const pos = START_POSITIONS[index % START_POSITIONS.length];
+function resetPlayer(room, player, index) {
+  const pos = room.startPositions[index % room.startPositions.length];
   player.x = pos.x;
   player.y = pos.y;
   player.alive = true;
@@ -972,7 +1012,7 @@ wss.on('connection', (ws) => {
     switch (msg.type) {
       case 'join': {
         const roomId = msg.roomId || 'default';
-        const room = getRoom(roomId, msg.mode);
+        const room = getRoom(roomId, msg.mode, msg.mapSize);
 
         if (room.players.size >= MAX_PLAYERS) {
           sendTo(ws, { type: 'error', message: 'Raum ist voll!' });
@@ -982,16 +1022,13 @@ wss.on('connection', (ws) => {
         currentRoom = room;
         currentPlayerId = room.nextPlayerId++;
 
-        const startPos = START_POSITIONS[currentPlayerId % START_POSITIONS.length];
         const player = {
           id: currentPlayerId,
           ws,
           name: (msg.name || `Spieler ${currentPlayerId + 1}`).slice(0, 16),
           color: START_COLORS[currentPlayerId % START_COLORS.length],
-          x: startPos.x,
-          y: startPos.y,
         };
-        resetPlayer(player, currentPlayerId);
+        resetPlayer(room, player, currentPlayerId);
         // Late joiners in a running hunt match are hunters
         if (room.mode === 'hunt' && room.gameStarted) player.role = 'hunter';
 
@@ -1026,8 +1063,8 @@ wss.on('connection', (ws) => {
         let { x, y } = msg;
         if (typeof x !== 'number' || typeof y !== 'number') return;
         // Keep the body fully inside the walkable area (border walls at 0 / max)
-        x = Math.max(1, Math.min(GRID_WIDTH - 2, x));
-        y = Math.max(1, Math.min(GRID_HEIGHT - 2, y));
+        x = Math.max(1, Math.min(currentRoom.gridW - 2, x));
+        y = Math.max(1, Math.min(currentRoom.gridH - 2, y));
 
         // Ghosts float through everything — no collision, no footprints,
         // no power-ups; they're just mobile team lights

@@ -1,6 +1,6 @@
-// Game constants (must match server.js)
-const GRID_WIDTH = 15;
-const GRID_HEIGHT = 13;
+// Grid dimensions come from the server with each map (small/medium/large)
+let GRID_WIDTH = 15;
+let GRID_HEIGHT = 13;
 const CELL_SIZE = 40;
 
 const TILE_EMPTY = 0;
@@ -351,6 +351,21 @@ function resetSeen() {
   for (let y = 0; y < GRID_HEIGHT; y++) seen[y] = new Array(GRID_WIDTH).fill(false);
 }
 resetSeen();
+
+// Adopt the map's dimensions and resize the canvases accordingly
+function applyMapDims(newMap) {
+  map = newMap;
+  const h = newMap.length;
+  const w = newMap[0] ? newMap[0].length : GRID_WIDTH;
+  if (w !== GRID_WIDTH || h !== GRID_HEIGHT || canvas.width !== w * CELL_SIZE) {
+    GRID_WIDTH = w;
+    GRID_HEIGHT = h;
+    canvas.width = w * CELL_SIZE;
+    canvas.height = h * CELL_SIZE;
+    darkCanvas.width = canvas.width;
+    darkCanvas.height = canvas.height;
+  }
+}
 
 function updateSeenTiles() {
   if (!meSpawned) return;
@@ -946,7 +961,8 @@ function joinGame() {
 
   ws.onopen = () => {
     const mode = document.getElementById('gameMode').value || 'classic';
-    ws.send(JSON.stringify({ type: 'join', name, roomId, mode }));
+    const mapSize = document.getElementById('mapSize').value || 'medium';
+    ws.send(JSON.stringify({ type: 'join', name, roomId, mode, mapSize }));
   };
 
   ws.onmessage = (e) => {
@@ -968,7 +984,7 @@ function handleMessage(msg) {
   switch (msg.type) {
     case 'joined':
       myId = msg.playerId;
-      map = msg.map;
+      applyMapDims(msg.map);
       gameMode = msg.mode || 'classic';
       gameStarted = msg.gameStarted;
       gameOver = msg.gameOver;
@@ -1139,7 +1155,7 @@ function handleMessage(msg) {
     }
 
     case 'roundStart':
-      map = msg.map;
+      applyMapDims(msg.map);
       roundNum = msg.round;
       gameMode = msg.mode || 'classic';
       gameStarted = true;
