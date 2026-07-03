@@ -2,10 +2,22 @@
 <html lang="de">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>Shadow Bomber</title>
+
+  <!-- PWA: installierbar als Handy-App -->
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#0d0d1a">
+  <link rel="icon" type="image/png" href="/icons/icon-192.png">
+  <!-- iOS (Safari nutzt kein Manifest für Icons) -->
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Shadow Bomber">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { touch-action: manipulation; overscroll-behavior: none; }
     body {
       background: #0d0d1a;
       color: #eee;
@@ -246,5 +258,13 @@
   </div>
 
   <script src="game.js"></script>
+  <script>
+    // PWA: Service Worker für Installierbarkeit & Offline-Shell
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js').catch(() => {});
+      });
+    }
+  </script>
 </body>
 </html>

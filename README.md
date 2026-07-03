@@ -53,6 +53,23 @@ npm start
 - 👟 **Schuh** — Schneller laufen
 - 🔦 **Fackel** — Größerer Lichtradius
 
+## 📱 Als Handy-App nutzen (PWA)
+
+Shadow Bomber ist eine installierbare Progressive Web App — kein App
+Store nötig, komplett kostenlos. Voraussetzung ist nur eine HTTPS-URL
+(z. B. das Render-Deployment unten).
+
+**Android (Chrome):** Spiel-URL öffnen → Chrome zeigt automatisch
+„App installieren" an (oder Menü ⋮ → *App installieren* / *Zum
+Startbildschirm hinzufügen*).
+
+**iPhone/iPad (Safari):** Spiel-URL öffnen → Teilen-Button (Quadrat mit
+Pfeil) → *Zum Home-Bildschirm*.
+
+Danach startet das Spiel mit eigenem Icon im Vollbild ohne
+Browserleiste. Touch-Steuerung (D-Pad, Bomben- und Schatten-Button)
+erscheint auf Touch-Geräten automatisch.
+
 ## Kostenloses Online-Deployment
 
 Das Spiel ist ein einzelner Node.js-Prozess (Server + Client zusammen),
